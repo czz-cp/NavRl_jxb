@@ -1,0 +1,62 @@
+# Occupancy Map Configuration for Manipulator
+# 机械臂的占据地图配置
+
+# 传感器输入模式
+sensor_input_mode: 0  # 0: depth image, 1: pointcloud
+localization_mode: 0  # 0: pose, 1: odom
+
+# 话题名称
+depth_image_topic: "/camera/aligned_depth_to_color/image_raw"
+point_cloud_topic: "/camera/depth/color/points"
+pose_topic: "/ee_link_pose"  # 需要从TF转换
+
+# 机器人尺寸 (末端执行器 + 安全边界)
+robot_size: [0.15, 0.15, 0.20]  # [x, y, z] 米
+
+# Realsense D435i 相机内参
+depth_intrinsics: [616.078, 616.391, 321.353, 241.558]  # [fx, fy, cx, cy]
+depth_scale_factor: 1000.0
+depth_min_value: 0.3  # 最小深度 0.3m
+depth_max_value: 3.0  # 最大深度 3.0m
+depth_filter_margin: 10
+depth_skip_pixel: 2  # 降采样
+
+# 图像尺寸
+image_cols: 640
+image_rows: 480
+
+# 坐标变换: ee_link到camera_link
+# 根据你的实际标定结果修改
+body_to_camera: [
+  -1.0, 0.0, 0.0, -0.0826,  # Rx
+   0.0, -1.0, 0.0, -0.0411,  # Ry
+   0.0, 0.0, 1.0, -0.0099,   # Rz
+   0.0, 0.0, 0.0, 1.0        # homogeneous
+]
+
+# 射线投射
+raycast_max_length: 3.0
+
+# 概率参数
+p_hit: 0.70
+p_miss: 0.35
+p_min: 0.12
+p_max: 0.97
+p_occ: 0.80
+
+# 地图参数
+map_resolution: 0.02  # 2cm分辨率（比无人机精细）
+ground_height: -0.1  # 桌面高度
+map_size: [2.0, 2.0, 1.5]  # 工作空间大小
+
+# 局部更新范围
+local_update_range: [1.0, 1.0, 1.0]
+local_bound_inflation: 0.1
+clean_local_map: true
+
+# 可视化
+local_map_size: [1.5, 1.5, 1.2]
+max_height_visualization: 1.5
+visualize_global_map: false
+verbose: true
+

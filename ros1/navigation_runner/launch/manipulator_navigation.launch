@@ -1,0 +1,93 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- ================================================================ -->
+    <!-- UR10e Manipulator Navigation with NavRL                         -->
+    <!-- 机械臂导航系统完整启动文件                                       -->
+    <!-- ================================================================ -->
+    
+    <!-- 参数 -->
+    <arg name="use_rviz" default="true"/>
+    <arg name="use_safety" default="true"/>
+    <arg name="debug" default="false"/>
+    
+    <!-- ================================================================ -->
+    <!-- 1. UR10e机械臂驱动                                               -->
+    <!-- ================================================================ -->
+    <include file="$(find visual_servo)/launch/UR_robot.launch">
+        <!-- 假设这个launch文件启动了: -->
+        <!-- - UR10e驱动 -->
+        <!-- - Realsense D435i -->
+        <!-- - TF发布 -->
+    </include>
+    
+    <!-- ================================================================ -->
+    <!-- 2. ArUco检测系统                                                 -->
+    <!-- ================================================================ -->
+    <!-- ArUco检测节点（复用你的现有代码） -->
+    <node pkg="visual_servo" type="aruco_detector.py" 
+          name="aruco_detector" output="screen">
+        <!-- 检测ArUco并发布TF: base_link -> aruco_marker_0 -->
+    </node>
+    
+    <!-- ArUco目标提供者（新增） -->
+    <node pkg="navigation_runner" type="aruco_target_provider.py"
+          name="aruco_target_provider" output="screen">
+        <param name="aruco_frame" value="aruco_marker_0"/>
+        <param name="base_frame" value="base_link"/>
+    </node>
+    
+    <!-- ================================================================ -->
+    <!-- 3. 感知系统                                                       -->
+    <!-- ================================================================ -->
+    
+    <!-- 3.1 占据地图 -->
+    <node pkg="map_manager" type="occupancy_map_node"
+          name="occupancy_map" output="screen">
+        <rosparam file="$(find map_manager)/cfg/manipulator_occupancy_map.yaml" 
+                  command="load"/>
+    </node>
+    
+    <!-- 3.2 动态障碍物检测 -->
+    <node pkg="onboard_detector" type="detector_node"
+          name="onboard_detector" output="screen">
+        <rosparam file="$(find onboard_detector)/cfg/manipulator_detector_param.yaml" 
+                  command="load"/>
+    </node>
+    
+    <!-- 可选: YOLO检测器（如果需要人体检测） -->
+    <!-- <node pkg="onboard_detector" type="yolo_detector.py"
+          name="yolo_detector" output="screen"/> -->
+    
+    <!-- ================================================================ -->
+    <!-- 4. 导航和控制                                                     -->
+    <!-- ================================================================ -->
+    
+    <!-- 4.1 RL导航节点 -->
+    <node pkg="navigation_runner" type="manipulator_navigation.py"
+          name="manipulator_navigation" output="screen">
+        <param name="config" 
+               value="$(find navigation_runner)/cfg/manipulator_nav.yaml"/>
+    </node>
+    
+    <!-- 4.2 安全动作节点（可选） -->
+    <node if="$(arg use_safety)" 
+          pkg="navigation_runner" type="safe_action_node"
+          name="safe_action" output="screen">
+        <rosparam file="$(find navigation_runner)/cfg/safe_action_param.yaml" 
+                  command="load"/>
+    </node>
+    
+    <!-- ================================================================ -->
+    <!-- 5. 可视化                                                         -->
+    <!-- ================================================================ -->
+    
+    <!-- RViz -->
+    <node if="$(arg use_rviz)" 
+          pkg="rviz" type="rviz" name="rviz"
+          args="-d $(find navigation_runner)/rviz/manipulator_nav.rviz"/>
+    
+    <!-- 静态TF发布器（如果需要） -->
+    <!-- 相机到末端的TF应该由视觉伺服launch文件提供 -->
+    
+</launch>
+

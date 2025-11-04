@@ -1,0 +1,94 @@
+# UR10e Manipulator Navigation Training Configuration
+# UR10e机械臂导航训练配置
+
+# 基础设置
+seed: 42
+headless: true
+device: "cuda:0"
+max_frame_num: 50000000  # 5000万帧
+
+# 仿真设置
+sim:
+  dt: 0.01  # 100Hz仿真
+  substeps: 1
+  gravity: [0.0, 0.0, -9.81]
+
+# 环境设置
+env:
+  num_envs: 256  # 并行环境数（机械臂比无人机慢，减少并行数）
+  episode_length: 500  # 每个episode最多500步 (5秒)
+  
+  # 静态障碍物
+  num_static_obstacles: 5
+  
+  # 动态障碍物（气球）
+  num_dynamic_obstacles: 3  # 增加到3个气球
+
+# 动态障碍物配置（气球）
+env_dyn:
+  vel_range: [0.05, 0.25]  # 气球漂浮速度 0.05-0.25 m/s（更慢）
+  local_range: [0.4, 0.4, 0.3]  # 局部移动范围 [X, Y, Z]（3D漂浮）
+
+# 传感器配置 (Realsense D435i)
+sensor:
+  depth_range: 3.0  # 最大3米
+  depth_fov_h: 87   # 水平视场角 87°
+  depth_fov_v: 58   # 垂直视场角 58°
+  depth_w: 80       # 降采样宽度
+  depth_h: 60       # 降采样高度
+
+# 机械臂配置
+robot:
+  type: "ur10e"
+  dof: 6
+  
+  # UR10e DH参数（如果需要）
+  dh_params:
+    d: [0.1807, 0, 0, 0.17415, 0.11985, 0.11655]
+    a: [0, -0.6127, -0.57155, 0, 0, 0]
+    alpha: [1.570796327, 0, 0, 1.570796327, -1.570796327, 0]
+
+# 工作空间
+workspace:
+  x_min: -0.8
+  x_max: 0.8
+  y_min: -0.8
+  y_max: 0.8
+  z_min: 0.0
+  z_max: 1.2
+
+# PPO算法配置
+algo:
+  training_frame_num: 16
+  training_epoch_num: 4
+  num_minibatches: 4
+  entropy_loss_coefficient: 0.01
+  
+  # Actor配置
+  actor:
+    learning_rate: 0.0003
+    action_limit: 1.0  # 归一化后的动作限制
+    clip_ratio: 0.2
+  
+  # Critic配置
+  critic:
+    learning_rate: 0.001
+    clip_ratio: 0.2
+  
+  # 特征提取器
+  feature_extractor:
+    learning_rate: 0.0003
+    dyn_obs_num: 5  # 考虑最近5个动态障碍物
+
+# 评估和保存
+eval_interval: 100  # 每100步评估一次
+save_interval: 500  # 每500步保存一次
+
+# Wandb配置
+wandb:
+  project: "manipulator-navigation"
+  name: "ur10e-navrl"
+  entity: CERLAB-UAV-RL-Navigation  # 你的wandb账号
+  mode: "online"  # online/offline/disabled
+  run_id: #kw9xf9k9
+

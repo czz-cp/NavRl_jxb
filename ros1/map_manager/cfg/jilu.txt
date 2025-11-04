@@ -1,0 +1,85 @@
+TensorDict
+├── "agents"
+│   └── "observation"
+│       ├── "state": [num_envs, 8]           # 无人机状态
+│       ├── "lidar": [num_envs, 1, H, W]     # 激光雷达扫描
+│       ├── "direction": [num_envs, 1, 3]    # 目标方向
+│       └── "dynamic_obstacle": [num_envs, 1, N, 10]  # 动态障碍物
+├── "stats"
+│   ├── "return": [num_envs, 1]
+│   ├── "episode_len": [num_envs, 1]
+│   ├── "reach_goal": [num_envs, 1]
+│   ├── "collision": [num_envs, 1]
+│   └── "truncated": [num_envs, 1]
+└── "info"
+    └── "drone_state": [num_envs, 1, 13]
+
+
+//聚类算法 边界框可视化：
+    7-------6
+   /|      /|
+  4-------5 |
+  | |     | |
+  | 3-----|-2
+  |/      |/
+  0-------1
+
+  原始点云
+    ↓
+DBSCAN聚类 → 初步聚类（pointCluster）
+    ↓
+K-means细化 → 更精细的聚类
+    ↓    
+方向估计 → 为每个聚类计算最优朝向
+    ↓
+边界框生成 → 生成旋转的3D边界框
+    ↓
+结果输出 → 多种格式的障碍物表示
+
+K-means：
+
+// 找到距离整体质心最远的点fpoint
+for (每个点):
+   计算点到质心的距离
+   记录最远点fpoint
+
+// 找到距离fpoint最远的点ffpoint  
+for (每个点):
+   计算点到fpoint的距离
+   记录最远点ffpoint
+
+// 初始中心 = [fpoint, ffpoint]
+目的​​：选择彼此距离最远的两个点作为初始中心，避免随机初始化导致的局部最优问题。
+
+for (迭代次数):
+   // 分配阶段
+   for (每个点):
+      计算点到两个中心的距离
+      分配到最近中心的簇
+
+   // 更新阶段  
+   for (每个簇):
+      计算簇内点的均值
+      更新中心点坐标
+
+// 根据最终中心点分类
+for (每个点):
+   cloudClusters[clusterIdx].points.push_back(point)
+
+// 计算每个簇的包围盒和中心
+for (每个簇):
+   找到最小/最大坐标
+   计算中心 = (min + max)/2
+
+//通过旋转点云并测试不同角度，找到使边界框密度最大的最优方向。
+边界框尺寸: (L, W, H) = (2.0m, 1.5m, 1.0m)
+地图分辨率: res_ = 0.2m
+
+体素网格: 
+lengthNum = 2.0/0.2 + 1 = 11
+widthNum  = 1.5/0.2 + 1 = 8.5 → 9 (取整)
+heightNum = 1.0/0.2 + 1 = 6
+
+理论体素数: 11 × 9 × 6 = 594
+实际点数: 300
+密度: 300 / 594 ≈ 0.505

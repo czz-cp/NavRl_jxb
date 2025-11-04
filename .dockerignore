@@ -1,0 +1,76 @@
+# Git
+.git
+.gitignore
+.gitattributes
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv
+
+# Jupyter
+.ipynb_checkpoints
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs and checkpoints
+logs/
+checkpoints/
+*.log
+*.pt
+*.pth
+*.ckpt
+
+# Documentation
+*.md
+docs/
+
+# Media
+media/
+*.gif
+*.jpg
+*.png
+
+# Build artifacts
+*.o
+*.a
+*.so
+
+# Temporary files
+tmp/
+temp/
+.cache/
+
+# ROS build artifacts (不需要在 Docker 训练镜像中)
+ros1/
+ros2/
+devel/
+build/
+install/
+
+# Other
+*.bak
+*.orig
+

@@ -1,0 +1,36 @@
+version: '3.8'
+
+services:
+  navrl-training:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: navrl-manipulator:latest
+    container_name: navrl_training
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - WANDB_API_KEY=${WANDB_API_KEY}
+      - ENV_NAME=NavRL
+    volumes:
+      - ./isaac-training:/workspace/isaac-training
+      - ./quick-demos:/workspace/quick-demos
+      - ./checkpoints:/workspace/checkpoints
+      - ./logs:/workspace/logs
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+    shm_size: '8gb'
+    stdin_open: true
+    tty: true
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    working_dir: /workspace/isaac-training/training/scripts
+    command: bash
+

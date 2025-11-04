@@ -1,0 +1,134 @@
+# Isaac Gym UR10e Manipulator 训练配置
+
+# 设备配置
+device: "cuda:0"
+sim:
+  device_id: 0
+
+# 可视化配置
+visualization:
+  enable: true  # 启用可视化
+  render_freq: 1  # 渲染频率 (每隔N步渲染一次)
+  camera_pos: [2.0, 2.0, 2.0]  # 相机位置
+  camera_target: [0.0, 0.0, 0.5]  # 相机目标
+  draw_lidar: true  # 绘制 LiDAR 射线
+  draw_camera_fov: true  # 绘制摄像头视野
+
+graphics:
+  graphics_device_id: 0
+
+# 资产路径 (使用 UR10e)
+assets:
+  asset_root: "/home/zar/Downloads/NavRL-main/isaac_gym_manipulator"
+  ur10_asset_file: "ur10e.urdf"
+
+# 环境配置
+env:
+  num_envs: 1  # 并行环境数量
+  max_episode_length: 800  # 最大步数（减小，避免Episode过长）
+  num_static_obstacles: 5
+  num_dynamic_obstacles: 3
+  
+  # 终止条件配置
+  terminate_on_collision: true       # 碰撞障碍物时终止
+  terminate_on_out_of_bounds: false   # 超出工作空间时终止
+  terminate_on_joint_limits: true    # 关节超限时终止
+  collision_distance: 0.15           # 碰撞距离阈值 (米) - 用于连杆-障碍物距离
+  workspace_limit: 2.0               # 工作空间半径限制 (米)
+  success_distance: 0.2              # 成功到达距离阈值 (米)
+  warning_distance: 0.2              # 接近警告距离阈值 (米)
+  
+  # 障碍物配置
+  obstacle_min_spacing: 0.4  # 障碍物之间的最小距离 (米)
+  obstacle_size: 0.2  # 障碍物默认尺寸 (立方体边长, 米)
+  obstacle_size_min: 0.15  # 障碍物最小尺寸 (米) - 用于随机大小
+  obstacle_size_max: 0.35  # 障碍物最大尺寸 (米) - 用于随机大小
+  obstacle_height_min: 0.0  # 障碍物离地最小高度 (米)
+  obstacle_height_max: 0.8  # 障碍物离地最大高度 (米)
+  obstacle_radius_min: 0.6  # 障碍物距离基座最小半径 (米)
+  obstacle_radius_max: 1.2  # 障碍物距离基座最大半径 (米)
+  
+  # 机械臂安全区域配置（避免障碍物卡住机械臂）
+  arm_safe_radius: 0.6  # 机械臂基座周围的安全半径 (米) - 初始时避免碰撞
+  arm_safe_height: 0.8  # 机械臂活动的安全高度 (米)
+  arm_safety_buffer: 0.1  # 额外的安全缓冲区 (米)
+  
+  # ArUco 目标配置
+  aruco_min_distance: 1.0  # ArUco 距离基座的最小距离 (米)
+  aruco_max_distance: 1.5  # ArUco 距离基座的最大距离 (米)
+  aruco_height_range: [0.0, 0.5]  # ArUco 高度范围 [最小, 最大] (米)
+  
+  # 摄像头视野配置（用于检测 ArUco）
+  camera_fov: 90.0  # 摄像头水平视场角 (度)
+  camera_max_distance: 2.0  # 摄像头最大检测距离 (米)
+  target_confirm_steps: 5  # 需要连续多少步看到目标才确认发现
+  camera_center_region: 20.0  # 视野中心区域角度（度），用于判断目标是否在中心
+  
+  # 奖励权重
+  reward_exploration: 1.0  # 探索奖励权重
+  reward_discovery: 30.0  # 发现目标奖励
+  reward_approach: 5.0  # 接近目标奖励权重
+  reward_reach: 100.0  # 到达目标奖励
+  
+  # 探索模式奖励细节
+  reward_z_exploration: 5.0  # Z轴向上探索奖励（只奖励向上移动+Z，不奖励向下-Z）
+  reward_downward_search: 5.0  # 摄像头朝下奖励（奖励摄像头朝向水平面以下，越朝下奖励越高）
+  reward_systematic_scan: 8.0  # 系统性扫描奖励
+  reward_active_exploration: 10.0  # 主动探索移动奖励（鼓励在探索阶段移动）
+  penalty_static_behavior: 15.0  # 静止不动惩罚（探索时应该移动）
+  
+  # 导航阶段视野管理奖励
+  reward_target_centered: 3.0  # 奖励将目标保持在视野中心
+  reward_aware_navigation: 2.0  # 奖励能同时看到目标和障碍物的视角
+  penalty_narrow_focus: 1.0  # 惩罚"盯着目标不看路"（只看目标不看障碍）
+
+# LiDAR 传感器配置 (模仿无人机)
+sensor:
+  lidar_range: 2.0  # LiDAR 最大探测距离 (米)
+  lidar_hres: 10.0  # 水平分辨率 (度)
+  lidar_vfov: [-10.0, 20.0]  # 垂直视场角 (度) [最小, 最大]
+  lidar_vbeams: 4  # 垂直光束数量
+
+# 训练配置（增强版） - 降低学习率稳定训练
+lr: 0.0001  # 通用学习率
+feature_lr: 0.0001  # 特征提取器学习率
+actor_lr: 0.0001  # Actor 学习率  
+critic_lr: 0.0001  # Critic 学习率（稍高以更快拟合Value）
+
+# 动作空间配置
+use_action_transform: true  # 启用动作空间变换
+action_coordinate: 'target'  # 'world', 'target', 'ee_frame'
+action_limit: 1.0  # 动作限制范围
+
+gamma: 0.99  # 折扣因子
+gae_lambda: 0.95  # GAE lambda
+ppo_epochs: 5  # PPO 更新轮数
+batch_size: 64  # Mini-batch 大小
+rollout_steps: 16  # Rollout 长度
+
+# PPO Clipping 配置（分离 Actor 和 Critic）- 降低以更保守的更新
+actor_clip_ratio: 0.2 # Actor 的 clip 参数（增加以允许更多探索）
+critic_clip_ratio: 0.2  # Critic 的 clip 参数
+clip_epsilon: 0.2  # 通用 clip 参数（向后兼容）
+
+value_coef: 0.5  # Value loss 系数（已废弃，entropy_loss 直接包含系数）
+entropy_coef: 0.01  # Entropy bonus 系数
+hidden_size: 256  # 隐藏层大小
+
+# 增强功能
+max_grad_norm: 1.0  # 梯度裁剪阈值（降低以防止梯度爆炸）
+use_value_norm: true  # 启用 Value Normalization
+use_huber_loss: true  # 使用 Huber Loss for Critic  
+value_norm_beta: 0.99  # Value Normalization 的 beta（降低以更快适应）
+
+# 训练目标配置
+training:
+  total_iterations: 5000  # 总训练迭代次数（根据这个计算 total_steps）
+  total_steps: 10000000  # 总训练步数目标（如果设置，会覆盖由总迭代次数计算的值）
+
+# 日志和调试配置
+log_interval: 10  # 每隔多少次迭代打印一次日志
+save_interval: 1000  # 每隔多少次迭代保存一次模型
+checkpoint_dir: "./checkpoints"  # 检查点保存目录
+debug_rewards: true  # 是否打印奖励分解调试信息
+debug_interval: 100  # 每隔多少步打印一次奖励分解

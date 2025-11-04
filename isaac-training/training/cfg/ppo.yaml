@@ -1,0 +1,18 @@
+algo:
+  feature_extractor:
+    learning_rate: 5e-4
+    dyn_obs_num: 5
+  
+  actor:
+    learning_rate: 5e-4
+    clip_ratio: 0.1   # PPO的clip参数（限制策略更新幅度）
+    action_limit: 2.0 # m/s
+  
+  critic:
+    learning_rate: 5e-4
+    clip_ratio: 0.1 # 可能用于价值函数的clip（非标准PPO） 
+  
+  entropy_loss_coefficient: 1e-3 # encourage exploration # 熵奖励系数（鼓励探索）
+  training_frame_num: 32 # 每次迭代使用的样本数（batch_size）
+  training_epoch_num: 4  # 每个batch数据的重复训练次数
+  num_minibatches: 16 # split into N minibatches   # 将batch拆分的minibatch数量

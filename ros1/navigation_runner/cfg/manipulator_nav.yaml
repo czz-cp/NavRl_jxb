@@ -1,0 +1,45 @@
+# Manipulator Navigation Configuration
+# 机械臂导航ROS配置
+
+# 设备
+device: "cuda:0"  # 或 "cpu"
+
+# 传感器参数 (Realsense D435i)
+sensor:
+  depth_range: 3.0
+  depth_fov_h: 87
+  depth_fov_v: 58
+  depth_w: 80
+  depth_h: 60
+
+# RL算法配置
+algo:
+  actor:
+    action_limit: 1.0
+    clip_ratio: 0.2
+  
+  critic:
+    clip_ratio: 0.2
+  
+  feature_extractor:
+    dyn_obs_num: 5  # 最多考虑5个动态障碍物
+
+# 控制参数
+control:
+  max_linear_vel: 0.3   # m/s
+  max_angular_vel: 0.5  # rad/s
+  goal_threshold: 0.05  # 5cm到达阈值
+  
+  # 安全参数
+  min_obstacle_distance: 0.15  # 15cm安全距离
+  emergency_stop_distance: 0.08  # 8cm紧急停止
+
+# 工作空间限制
+workspace:
+  x_min: -0.8
+  x_max: 0.8
+  y_min: -0.8
+  y_max: 0.8
+  z_min: 0.0
+  z_max: 1.2
+

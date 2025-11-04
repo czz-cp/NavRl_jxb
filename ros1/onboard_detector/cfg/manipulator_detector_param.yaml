@@ -1,0 +1,91 @@
+# Dynamic Detector Configuration for Manipulator
+# 机械臂场景的动态检测器配置
+
+# 定位模式
+localization_mode: 0  # 0: pose, 1: odom
+
+# 话题名称
+depth_image_topic: "/camera/depth/image_rect_raw"
+aligned_depth_image_topic: "/camera/aligned_depth_to_color/image_raw"
+color_image_topic: "/camera/color/image_raw"
+pose_topic: "/ee_link_pose"  # 需要从TF转换
+
+# Realsense D435i 深度相机内参
+depth_intrinsics: [616.078, 616.391, 321.353, 241.558]
+depth_scale_factor: 1000.0
+depth_min_value: 0.3
+depth_max_value: 3.0
+depth_filter_margin: 10
+depth_skip_pixel: 2
+image_cols: 640
+image_rows: 480
+
+# Realsense D435i 彩色相机内参
+color_intrinsics: [616.078, 616.391, 321.353, 241.558]
+
+# 坐标变换
+body_to_camera: [
+  -1.0, 0.0, 0.0, -0.0826,
+   0.0, -1.0, 0.0, -0.0411,
+   0.0, 0.0, 1.0, -0.0099,
+   0.0, 0.0, 0.0, 1.0
+]
+
+body_to_camera_color: [
+  -1.0, 0.0, 0.0, -0.0826,
+   0.0, -1.0, 0.0, -0.0411,
+   0.0, 0.0, 1.0, -0.0099,
+   0.0, 0.0, 0.0, 1.0
+]
+
+# 检测参数
+raycast_max_length: 3.0
+voxel_occupied_thresh: 8
+ground_height: -0.1
+
+# DBSCAN聚类
+dbscan_min_points_cluster: 15
+dbscan_search_range_epsilon: 0.15  # 更小的epsilon（机械臂场景更精细）
+
+# 边界框过滤
+filtering_BBox_IOU_threshold: 0.4
+
+# YOLO
+yolo_overwrite_distance: 2.0
+
+# 跟踪参数
+history_size: 5
+prediction_size: 5
+time_difference: 0.033  # 30Hz
+
+# 数据关联
+similarity_threshold: 0.85
+retrack_similarity_threshold: 0.5
+frame_skip: 5
+
+# 动态分类（气球）
+dynamic_velocity_threshold: 0.05  # 气球漂浮速度很慢
+dynamic_voting_threshold: 0.75
+maximum_skip_ratio: 0.5
+fix_size_history_threshold: 8
+fix_size_dimension_threshold: 0.08  # 气球尺寸变化小
+
+# 强制动态
+frames_force_dynamic: 15
+frames_force_dynamic_check_range: 25
+dynamic_consistency_threshold: 3
+
+# 卡尔曼滤波器参数（气球运动更平滑）
+e_p: 0.5
+e_q_pos: 0.2  # 位置过程噪声较小
+e_q_vel: 0.2  # 速度过程噪声较小
+e_q_acc: 0.3  # 加速度较小
+e_r_pos: 0.3  # 观测噪声
+e_r_vel: 0.3
+e_r_acc: 0.4
+kalman_filter_averaging_frames: 10  # 更多帧平均
+
+# 目标对象尺寸约束（气球）
+constrain_size: true
+target_object_size: [0.2, 0.2, 0.2]  # 气球典型尺寸（球形，直径20cm）
+
