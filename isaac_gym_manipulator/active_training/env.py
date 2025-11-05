@@ -2440,7 +2440,8 @@ class ArmNavEnv:
         端到端两阶段奖励函数（探索+到达）
         
         阶段1（未发现）：探索奖励 + 障碍物惩罚
-        阶段2（已发现）：多角度观察 + 到达目标奖励 + 障碍物惩罚
+        阶段2（已发现）：多角度观察 + 相机朝向变化 + 障碍物惩罚
+        阶段3（发现后）：靠近奖励（端到端到达目标奖励：位置误差惩罚 + 零误差鼓励）+ 障碍物惩罚
         
         Args:
             action_xyz: [N, 6] 动作（关节角度增量）
@@ -2501,9 +2502,10 @@ class ArmNavEnv:
             except Exception as e:
                 print(f"[Warning] Failed to compute exploration rewards: {e}")
         
-        # 3.2 已发现阶段：观察奖励
+        # 3.2 已发现阶段：观察奖励 + 靠近奖励
         if discovered_mask.any():
             try:
+                # 3.2.1 观察奖励（多角度观察 + 相机朝向变化）
                 observation_reward = self._compute_simplified_observation_rewards(action_xyz, cfg)  # [N]
                 if observation_reward.shape[0] == N:
                     total_reward += observation_reward
@@ -2514,6 +2516,19 @@ class ArmNavEnv:
                         total_reward[:observation_reward.shape[0]] += observation_reward
             except Exception as e:
                 print(f"[Warning] Failed to compute observation rewards: {e}")
+            
+            # 3.2.2 靠近奖励（发现ArUco后的端到端到达目标奖励）
+            try:
+                approaching_reward = self._compute_approaching_reward(cfg)  # [N]
+                if approaching_reward.shape[0] == N:
+                    total_reward += approaching_reward
+                else:
+                    if approaching_reward.shape[0] > N:
+                        total_reward += approaching_reward[:N]
+                    else:
+                        total_reward[:approaching_reward.shape[0]] += approaching_reward
+            except Exception as e:
+                print(f"[Warning] Failed to compute approaching rewards: {e}")
         
         # 计算当前角度（用于角度塑形）
         try:
@@ -2651,8 +2666,8 @@ class ArmNavEnv:
     
     def _compute_simplified_observation_rewards(self, action_xyz: torch.Tensor, cfg: dict) -> torch.Tensor:
         """
-        简化的观察奖励（已发现目标阶段 - 端到端设计）
-        包含：多角度观察 + 相机朝向变化 + 到达目标奖励
+        简化的观察奖励（已发现目标阶段）
+        包含：多角度观察 + 相机朝向变化
         
         Args:
             action_xyz: [N, 6] 关节角度增量
@@ -2678,13 +2693,50 @@ class ArmNavEnv:
             if wrist_rotation_reward.shape[0] == N:
                 reward += view_change_coef * wrist_rotation_reward
             
-            # 3. 端到端到达目标奖励（新设计）
-            # 公式1: 位置误差惩罚 -ω₁e² (误差越大，惩罚越大)
-            # 公式2: 零误差鼓励 ln(e² + τₑ) (误差越小，奖励越大；误差为0时奖励最大)
-            # e = ||pt - pe|| = ||target_pos - ee_pos|| (欧氏距离)
-            # ω₁ = 10⁻³, τₑ = 10⁻⁴
-            omega1 = cfg['reward'].get('omega1', 0.001)  # 10^-3
-            tau_e = cfg['reward'].get('tau_e', 0.0001)   # 10^-4
+            # 🎯 注意：端到端到达目标奖励已移至 _compute_approaching_reward()，在发现后才应用
+            
+            # 检查 NaN/Inf
+            if torch.isnan(reward).any() or torch.isinf(reward).any():
+                nan_mask = torch.isnan(reward) | torch.isinf(reward)
+                reward[nan_mask] = 0.0
+                
+        except Exception as e:
+            print(f"[Warning] _compute_simplified_observation_rewards failed: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return reward
+    
+    def _compute_approaching_reward(self, cfg: dict) -> torch.Tensor:
+        """
+        靠近奖励（发现ArUco码后的端到端到达目标奖励）
+        
+        只在发现目标后应用，鼓励机械臂靠近并到达目标。
+        
+        公式：
+        1. 位置误差惩罚: -ω₁e² (误差越大，惩罚越大)
+        2. 零误差鼓励: ln(e² + τₑ) (误差越小，奖励越大；误差为0时奖励最大)
+        e = ||pt - pe|| = ||target_pos - ee_pos|| (欧氏距离)
+        
+        Args:
+            cfg: 配置字典
+        
+        Returns:
+            [N] 靠近奖励张量（只对已发现目标的环境应用）
+        """
+        N = self.num_envs
+        reward = torch.zeros(N, device=self.device)
+        
+        try:
+            # 只对已发现目标的环境应用靠近奖励
+            discovered_mask = self.target_discovered  # [N]
+            
+            if not discovered_mask.any():
+                return reward  # 没有环境发现目标，返回零奖励
+            
+            # 获取配置参数
+            omega1 = cfg['reward'].get('omega1', 0.001)  # 10^-3 误差权重系数
+            tau_e = cfg['reward'].get('tau_e', 0.0001)   # 10^-4 误差阈值
             
             # 计算末端执行器与目标的欧氏距离
             error = torch.norm(self.target_pos - self.ee_pos, dim=1)  # [N]
@@ -2699,7 +2751,9 @@ class ArmNavEnv:
             
             # 组合到达目标奖励
             reaching_reward = position_error_penalty + zero_error_encouragement
-            reward += reaching_reward
+            
+            # 只对已发现目标的环境应用奖励
+            reward[discovered_mask] = reaching_reward[discovered_mask]
             
             # 检查 NaN/Inf
             if torch.isnan(reward).any() or torch.isinf(reward).any():
@@ -2707,7 +2761,7 @@ class ArmNavEnv:
                 reward[nan_mask] = 0.0
                 
         except Exception as e:
-            print(f"[Warning] _compute_simplified_observation_rewards failed: {e}")
+            print(f"[Warning] _compute_approaching_reward failed: {e}")
             import traceback
             traceback.print_exc()
         
