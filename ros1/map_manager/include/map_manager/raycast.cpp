@@ -19,6 +19,7 @@ double mod(double value, double modulus) {
   return fmod(fmod(value, modulus) + modulus, modulus);
 }
 
+// 求解最小的 t > 0，使得 s + t*ds 是整数
 double intbound(double s, double ds) {
   // Find the smallest positive t such that s+t*ds is an integer.
   if (ds < 0) {

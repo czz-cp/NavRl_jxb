@@ -39,41 +39,44 @@ namespace mapManager{
 		std::string hint_;
 
 		// ROS
-		ros::NodeHandle nh_;
-		std::shared_ptr<message_filters::Subscriber<sensor_msgs::Image>> depthSub_;
-		std::shared_ptr<message_filters::Subscriber<sensor_msgs::PointCloud2>> pointcloudSub_;
-		std::shared_ptr<message_filters::Subscriber<geometry_msgs::PoseStamped>> poseSub_;
+		ros::NodeHandle nh_; // 节点句柄，用于管理ROS节点
+		std::shared_ptr<message_filters::Subscriber<sensor_msgs::Image>> depthSub_;	// 深度图订阅器
+		std::shared_ptr<message_filters::Subscriber<sensor_msgs::PointCloud2>> pointcloudSub_;	// 点云订阅器
+		std::shared_ptr<message_filters::Subscriber<geometry_msgs::PoseStamped>> poseSub_;	// 位姿订阅器
 		typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::Image, geometry_msgs::PoseStamped> depthPoseSync;
-		std::shared_ptr<message_filters::Synchronizer<depthPoseSync>> depthPoseSync_;
+		std::shared_ptr<message_filters::Synchronizer<depthPoseSync>> depthPoseSync_;	// 深度图和位姿同步器
 		std::shared_ptr<message_filters::Subscriber<nav_msgs::Odometry>> odomSub_;
 		typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::Image, nav_msgs::Odometry> depthOdomSync;
-		std::shared_ptr<message_filters::Synchronizer<depthOdomSync>> depthOdomSync_;
+		std::shared_ptr<message_filters::Synchronizer<depthOdomSync>> depthOdomSync_;	// 深度图和里程计同步器
 		typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::PointCloud2, geometry_msgs::PoseStamped> pointcloudPoseSync;
-		std::shared_ptr<message_filters::Synchronizer<pointcloudPoseSync>> pointcloudPoseSync_;
+		std::shared_ptr<message_filters::Synchronizer<pointcloudPoseSync>> pointcloudPoseSync_;	// 点云和位姿同步器
 		typedef message_filters::sync_policies::ApproximateTime<sensor_msgs::PointCloud2, nav_msgs::Odometry> pointcloudOdomSync;
-		std::shared_ptr<message_filters::Synchronizer<pointcloudOdomSync>> pointcloudOdomSync_;	
-		ros::Timer occTimer_;
-		ros::Timer inflateTimer_;
-		ros::Timer staticClusteringTimer_;
-		ros::Timer projPointsVisTimer_;
-		ros::Timer visTimer_;
-		ros::Timer mapVisTimer_;
-		ros::Timer inflatedMapVisTimer_;
-		ros::Timer map2DVisTimer_;
-		ros::Publisher depthCloudPub_;
-		ros::Publisher mapVisPub_;
-		ros::Publisher inflatedMapVisPub_;
-		ros::Publisher map2DPub_;
-		ros::Publisher mapExploredPub_;
-		ros::Publisher localCloudPub_;
-		ros::Publisher staticObstacleVisPub_;
-		ros::ServiceServer collisionCheckServer_;
-		ros::ServiceServer raycastServer_;
-		ros::ServiceServer staticObstacleServer_;
+		std::shared_ptr<message_filters::Synchronizer<pointcloudOdomSync>> pointcloudOdomSync_;	// 点云和里程计同步器
 
-		int sensorInputMode_;
-		int localizationMode_;
-		std::string depthTopicName_; // depth image topic
+		ros::Timer occTimer_; // 占用更新定时器		
+		ros::Timer inflateTimer_; // 地图膨胀定时器
+		ros::Timer staticClusteringTimer_; // 静态障碍物聚类定时器		
+		ros::Timer projPointsVisTimer_; // 投影点可视化定时器					
+		ros::Timer visTimer_; // 可视化定时器
+		ros::Timer mapVisTimer_; // 地图可视化定时器
+		ros::Timer inflatedMapVisTimer_; // 膨胀地图可视化定时器
+		ros::Timer map2DVisTimer_; // 2D地图可视化定时器
+
+		ros::Publisher depthCloudPub_; // 深度点云发布器
+		ros::Publisher mapVisPub_; // 地图可视化发布器
+		ros::Publisher inflatedMapVisPub_; // 膨胀地图可视化发布器
+		ros::Publisher map2DPub_; // 2D地图可视化发布器
+		ros::Publisher mapExploredPub_; // 探索地图可视化发布器			
+		ros::publisher localCloudPub_; // 局部点云发布器
+		ros::Publisher staticObstacleVisPub_; // 静态障碍物可视化发布器		
+		
+		ros::ServiceServer collisionCheckServer_; // 碰撞检查服务服务器		
+		ros::ServiceServer raycastServer_; // 射线投射服务服务器
+		ros::ServiceServer staticObstacleServer_; // 静态障碍物服务服务器
+
+		int sensorInputMode_; // 传感器输入模式
+		int localizationMode_; // 定位模式
+		std::string depthTopicName_; // 深度图像话题
 		std::string pointcloudTopicName_; // point cloud topic
 		std::string poseTopicName_;  // pose topic
 		std::string odomTopicName_; // odom topic 
@@ -81,37 +84,37 @@ namespace mapManager{
 		// parameters
 		// -----------------------------------------------------------------
 		// ROBOT SIZE
-		Eigen::Vector3d robotSize_;
+		Eigen::Vector3d robotSize_; // 机器人尺寸
 
 		// CAMERA
-		double fx_, fy_, cx_, cy_; // depth camera intrinsics
-		double depthScale_; // value / depthScale
-		double depthMinValue_, depthMaxValue_;
-		int depthFilterMargin_, skipPixel_; // depth filter margin
-		int imgCols_, imgRows_;
-		Eigen::Matrix4d body2Cam_; // from body frame to camera frame
+		double fx_, fy_, cx_, cy_; // 深度相机内参
+		double depthScale_; // 深度值 / 深度缩放因子
+		double depthMinValue_, depthMaxValue_; // 深度最小值和最大值
+		int depthFilterMargin_, skipPixel_; // 深度滤波边缘和跳过像素
+		int imgCols_, imgRows_; // 图像列数和行数
+		Eigen::Matrix4d body2Cam_; // 从机体坐标系到相机坐标系的变换矩阵
 
 		// RAYCASTING
-		double raycastMaxLength_;
+		double raycastMaxLength_; // 射线投射最大长度
 		double pHitLog_, pMissLog_, pMinLog_, pMaxLog_, pOccLog_; 
 
 		// MAP
 		double UNKNOWN_FLAG_ = 0.01;
-		double mapRes_;
-		double groundHeight_; // ground height in z axis
-		Eigen::Vector3d mapSize_, mapSizeMin_, mapSizeMax_; // reserved min/max map size
-		Eigen::Vector3i mapVoxelMin_, mapVoxelMax_; // reserved min/max map size in voxel
-		Eigen::Vector3d localUpdateRange_; // self defined local update range
-		double localBoundInflate_; // inflate local map for some distance
+		double mapRes_; // 地图分辨率		
+		double groundHeight_; // 地面高度 in z 轴
+		Eigen::Vector3d mapSize_, mapSizeMin_, mapSizeMax_; // 预留最小/最大地图尺寸
+		Eigen::Vector3i mapVoxelMin_, mapVoxelMax_; // 预留最小/最大地图尺寸 in voxel
+		Eigen::Vector3d localUpdateRange_; // 自定义局部更新范围
+		double localBoundInflate_; // 膨胀局部地图 for some distance
 		bool cleanLocalMap_; 
-		std::string prebuiltMapDir_;
+		std::string prebuiltMapDir_; // 预构建地图目录
 
 		// VISUALZATION
-		double maxVisHeight_;
-		Eigen::Vector3d localMapSize_;
-		Eigen::Vector3i localMapVoxel_; // voxel representation of local map size
-		bool visGlobalMap_;
-		bool verbose_;
+		double maxVisHeight_; // 最大可视高度	
+		Eigen::Vector3d localMapSize_; // 局部地图尺寸
+		Eigen::Vector3i localMapVoxel_; // 局部地图尺寸 in voxel
+		bool visGlobalMap_; // 可视化全局地图
+		bool verbose_; // 详细输出
 		// -----------------------------------------------------------------
 
 
@@ -119,42 +122,42 @@ namespace mapManager{
 		// data
 		// -----------------------------------------------------------------
 		// SENSOR DATA
-		cv::Mat depthImage_;
-		pcl::PointCloud<pcl::PointXYZ> pointcloud_;
-		Eigen::Vector3d position_; // current position
-		Eigen::Matrix3d orientation_; // current orientation
-		Eigen::Vector3i localBoundMin_, localBoundMax_; // sensor data range
+		cv::Mat depthImage_; // 深度图像
+		pcl::PointCloud<pcl::PointXYZ> pointcloud_; // 点云
+		Eigen::Vector3d position_; // 当前位置
+		Eigen::Matrix3d orientation_; // 当前方向
+		Eigen::Vector3i localBoundMin_, localBoundMax_; // 传感器数据范围
 
 
 		// MAP DATA
-		int projPointsNum_ = 0;
+		int projPointsNum_ = 0; // 投影点数量
 		std::vector<Eigen::Vector3d> projPoints_; // projected points from depth image
-		std::vector<int> countHitMiss_;
-		std::vector<int> countHit_;
-		std::queue<Eigen::Vector3i> updateVoxelCache_;
-		std::vector<double> occupancy_; // occupancy log data
-		std::vector<bool> occupancyInflated_; // inflated occupancy data
-		int raycastNum_ = 0; 
+		std::vector<int> countHitMiss_; // 命中/未命中计数
+		std::vector<int> countHit_; // 命中计数
+		std::queue<Eigen::Vector3i> updateVoxelCache_; // 更新体素缓存
+		std::vector<double> occupancy_; // 占用日志数据
+		std::vector<bool> occupancyInflated_; // 膨胀占用数据
+		int raycastNum_ = 0; // 射线投射数量
 		std::vector<int> flagTraverse_, flagRayend_;
-		std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> freeRegions_;
-		std::deque<std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>>> histFreeRegions_;
-		Eigen::Vector3d currMapRangeMin_ = Eigen::Vector3d (0, 0, 0); 
-		Eigen::Vector3d currMapRangeMax_ = Eigen::Vector3d (0, 0, 0);
-		bool useFreeRegions_ = false;
+		std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> freeRegions_; // 自由区域
+		std::deque<std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>>> histFreeRegions_; // 历史自由区域
+		Eigen::Vector3d currMapRangeMin_ = Eigen::Vector3d (0, 0, 0); // 当前地图范围最小值
+		Eigen::Vector3d currMapRangeMax_ = Eigen::Vector3d (0, 0, 0); // 当前地图范围最大值
+		bool useFreeRegions_ = false; // 使用自由区域
 		
 
 		// STATUS
-		bool occNeedUpdate_ = false;
-		bool mapNeedInflate_ = false;
-		bool esdfNeedUpdate_ = false; // only used in ESDFMap
+		bool occNeedUpdate_ = false; // 占用需要更新
+		bool mapNeedInflate_ = false; // 地图需要膨胀
+		bool esdfNeedUpdate_ = false; // 仅用于ESDFMap
 
 		// Raycaster
-		RayCaster raycaster_;
+		RayCaster raycaster_; // 射线投射器
 
 		// Clustering
-		std::shared_ptr<obstacleClustering> obclustering_;
-		std::vector<Eigen::Vector3d> currCloud_;
-		std::vector<bboxVertex> refinedBBoxVertices_;
+		std::shared_ptr<obstacleClustering> obclustering_; // 障碍物聚类器
+		std::vector<Eigen::Vector3d> currCloud_; // 当前点云
+		std::vector<bboxVertex> refinedBBoxVertices_; // 细化边界框顶点
 		// ------------------------------------------------------------------
 
 	public:

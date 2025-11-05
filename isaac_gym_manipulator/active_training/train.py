@@ -324,13 +324,25 @@ def main():
 
     prev_angle_deg = None#上一个关节角度
     env.reset()
+    
+    # 🎯 关键修复：reset()后GPU同步，确保动态障碍物更新完成
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
 
     # 体素网格定义：以末端为中心的立方体
     grid_origin = torch.tensor([-1.0, -1.0, -1.0], device=env.device)
     grid_size = torch.tensor([Vx, Vy, Vz], device=env.device)
     voxel_res = torch.tensor([2.0 / Vx, 2.0 / Vy, 2.0 / Vz], device=env.device)
 
-    gae = GAE(gamma=gamma, lam=lam, device=env.device)
+    # 🎯 自适应折扣因子配置
+    use_adaptive_gamma = cfg['ppo'].get('use_adaptive_gamma', False)
+    eta_min = cfg['ppo'].get('eta_min', 0.6)
+    eta_max = cfg['ppo'].get('eta_max', 0.99)
+    
+    gae = GAE(gamma=gamma, lam=lam, device=env.device,
+              use_adaptive_gamma=use_adaptive_gamma,
+              eta_min=eta_min, eta_max=eta_max)
     
     # 增量体素更新选项（体素构建优化）
     use_incremental_voxel = cfg.get('voxel', {}).get('use_incremental_update', False)
@@ -370,6 +382,12 @@ def main():
     for it in range(1, total_iters + 1):#总迭代次数
         print(f"\n[Iteration {it}/{total_iters}] Starting rollout collection...")
         
+        # 🎯 关键修复：在每个iteration开始时，清空已计数环境的集合，避免跨iteration的计数问题
+        if not hasattr(main, '_counted_envs_in_rollout'):
+            main._counted_envs_in_rollout = set()
+        else:
+            main._counted_envs_in_rollout.clear()
+        
         # 预分配tensor替代列表append（内存优化）
         voxels = torch.zeros((rollout, num_envs, *voxel_shape), device=env.device)#体素地图
         auxes = torch.zeros((rollout, num_envs, aux_dim_val), device=env.device)#机器人状态信息
@@ -379,6 +397,32 @@ def main():
         vals = torch.zeros((rollout, num_envs), device=env.device)#价值函数估计
         vals_den = torch.zeros((rollout, num_envs), device=env.device)#价值函数估计的归一化
         dones_list = torch.zeros((rollout, num_envs), dtype=torch.bool, device=env.device)#是否完成
+        # 🎯 动作概率（用于自适应折扣因子）
+        action_probs = torch.zeros((rollout, num_envs), device=env.device) if use_adaptive_gamma else None
+        
+        # 🎯 关键修复：验证张量形状匹配，防止内存访问越界
+        try:
+            assert voxels.shape == (rollout, num_envs, *voxel_shape), \
+                f"[Error] Voxel shape mismatch: {voxels.shape} vs {(rollout, num_envs, *voxel_shape)}"
+            assert auxes.shape == (rollout, num_envs, aux_dim_val), \
+                f"[Error] Aux shape mismatch: {auxes.shape} vs {(rollout, num_envs, aux_dim_val)}"
+            assert acts.shape == (rollout, num_envs, action_dim_val), \
+                f"[Error] Acts shape mismatch: {acts.shape} vs {(rollout, num_envs, action_dim_val)}"
+            assert logps.shape == (rollout, num_envs), \
+                f"[Error] Logps shape mismatch: {logps.shape} vs {(rollout, num_envs)}"
+            assert rews.shape == (rollout, num_envs), \
+                f"[Error] Rews shape mismatch: {rews.shape} vs {(rollout, num_envs)}"
+            assert vals.shape == (rollout, num_envs), \
+                f"[Error] Vals shape mismatch: {vals.shape} vs {(rollout, num_envs)}"
+            assert dones_list.shape == (rollout, num_envs), \
+                f"[Error] Dones shape mismatch: {dones_list.shape} vs {(rollout, num_envs)}"
+            if action_probs is not None:
+                assert action_probs.shape == (rollout, num_envs), \
+                    f"[Error] Action_probs shape mismatch: {action_probs.shape} vs {(rollout, num_envs)}"
+            logger.log("✅ 张量形状验证通过")
+        except AssertionError as e:
+            logger.error(f"❌ 张量形状验证失败: {e}")
+            raise
 
         # 数据收集阶段（rollout）
         episode_rewards = torch.zeros(num_envs, device=env.device)
@@ -392,82 +436,92 @@ def main():
                 print(f"[Rollout] Step {t+1}/{rollout} (iter {it}/{total_iters})")
                 logger.log(f"[Rollout] Step {t+1}/{rollout} (iter {it}/{total_iters})")
             
-            # 渲染深度并构建体素
-            depth = env.render_depth()#渲染深度图
-            cam_T_w = env.camera_pose()
-            intr = env.intrinsics#相机内参矩阵
-            
-            # 🎯 调试：检查深度图
-            if t == 0 and it == 1:
-                # 🎯 修复：检查深度图是否为空，避免在空张量上调用 min/max
-                if depth.numel() > 0:
-                    depth_min = depth.min().item()
-                    depth_max = depth.max().item()
-                    logger.log(f"深度图形状: {depth.shape}, 范围: [{depth_min:.3f}, {depth_max:.3f}]")
-                    logger.save_state("depth_first_step", depth, iteration=it)
-                else:
-                    logger.log(f"深度图形状: {depth.shape}, 但张量为空（numel=0）")
-                    logger.warning("深度图为空，跳过保存")
-            
-            # 检查深度图是否有无效值（仅在非空时检查和处理）
-            if depth.numel() > 0:
-                if torch.isnan(depth).any() or torch.isinf(depth).any():
-                    if t == 0:  # 只在第一步打印，避免刷屏
-                        nan_count = torch.isnan(depth).sum().item()
-                        inf_count = torch.isinf(depth).sum().item()
-                        logger.error(f"深度图包含无效值: NaN={nan_count}, Inf={inf_count}")
-                    # 将非有限值替换为最大范围值
-                    depth = torch.where(torch.isfinite(depth), depth, 
-                                       torch.full_like(depth, env.max_range))
+            # 🎯 关键修复：当启用viewer时，完全跳过相机和体素相关操作，避免段错误
+            # 只保留基本的仿真和可视化功能
+            if env.enable_viewer:
+                # 当启用viewer时，跳过所有相机和体素操作，使用空体素地图
+                # 创建空的体素地图
+                Nx, Ny, Nz = map(int, grid_size.tolist())
+                voxel = torch.zeros((1, 1, Nx, Ny, Nz), device=env.device)
+                # 辅助观测序列（使用空体素地图）
+                aux = env.observe(voxel=voxel, grid_origin=grid_origin, voxel_res=voxel_res)
             else:
-                if t == 0:  # 只在第一步打印
-                    logger.warning("深度图为空，跳过有效性检查和体素构建")
-                # 如果深度图为空，使用已有的 global_voxel 或创建空体素地图
-                if global_voxel is not None:
-                    voxel = global_voxel.clone()
+                # 不启用viewer时，正常执行所有操作
+                depth = env.render_depth()#渲染深度图
+                cam_T_w = env.camera_pose()
+                intr = env.intrinsics#相机内参矩阵
+                
+                # 🎯 调试：检查深度图
+                if t == 0 and it == 1:
+                    # 🎯 修复：检查深度图是否为空，避免在空张量上调用 min/max
+                    if depth.numel() > 0:
+                        depth_min = depth.min().item()
+                        depth_max = depth.max().item()
+                        logger.log(f"深度图形状: {depth.shape}, 范围: [{depth_min:.3f}, {depth_max:.3f}]")
+                        logger.save_state("depth_first_step", depth, iteration=it)
+                    else:
+                        logger.log(f"深度图形状: {depth.shape}, 但张量为空（numel=0）")
+                        logger.warning("深度图为空，跳过保存")
+                
+                # 检查深度图是否有无效值（仅在非空时检查和处理）
+                if depth.numel() > 0:
+                    if torch.isnan(depth).any() or torch.isinf(depth).any():
+                        if t == 0:  # 只在第一步打印，避免刷屏
+                            nan_count = torch.isnan(depth).sum().item()
+                            inf_count = torch.isinf(depth).sum().item()
+                            logger.error(f"深度图包含无效值: NaN={nan_count}, Inf={inf_count}")
+                        # 将非有限值替换为最大范围值
+                        depth = torch.where(torch.isfinite(depth), depth, 
+                                           torch.full_like(depth, env.max_range))
                 else:
-                    # 创建空的体素地图
-                    Nx, Ny, Nz = map(int, grid_size.tolist())
-                    voxel = torch.zeros((1, 1, Nx, Ny, Nz), device=env.device)
-                # 跳过体素构建，直接使用已有的体素地图
-                # 注意：后续代码仍会正常执行（动作、观测等）
-            
-            # 体素构建优化：使用增量更新或完全重建（仅在深度图非空时）
-            if depth.numel() > 0:
-                if use_incremental_voxel and global_voxel is not None:
-                    # 增量更新全局体素地图
-                    global_voxel = update_voxel_from_depth(
-                        global_voxel=global_voxel,
-                        depth=depth,
-                        cam_T_w=cam_T_w,
-                        intrinsics=intr,
-                        grid_origin=grid_origin,
-                        grid_size=grid_size, # 体素数量 [Vx, Vy, Vz]
-                        voxel_res=voxel_res,# 体素分辨率 [2.0/Vx, 2.0/Vy, 2.0/Vz]
-                        max_range=env.max_range,
-                        subsample=4, # 像素采样步长
-                        decay_factor=cfg.get('voxel', {}).get('decay_factor', 0.95),
-                        device=env.device,
-                    )
-                    voxel = global_voxel.clone()  # 使用更新后的全局地图
-                else:
-                    # 完全重建体素地图（原始方法）
-                    voxel = build_voxel_from_depth(
-                        depth=depth,
-                        cam_T_w=cam_T_w,
-                        intrinsics=intr,
-                        grid_origin=grid_origin,
-                        grid_size=grid_size,
-                        voxel_res=voxel_res,
-                        max_range=env.max_range,
-                        subsample=4,
-                        device=env.device,
-                    ) 
-            logger.log(f"体素处理前: {voxel.shape}")
-            # 辅助观测序列（传入体素地图用于障碍物距离计算）
-            aux = env.observe(voxel=voxel, grid_origin=grid_origin, voxel_res=voxel_res) 
-            
-            logger.log(f"辅助观测处理前: {aux.shape}")
+                    if t == 0:  # 只在第一步打印
+                        logger.warning("深度图为空，跳过有效性检查和体素构建")
+                    # 如果深度图为空，使用已有的 global_voxel 或创建空体素地图
+                    if global_voxel is not None:
+                        voxel = global_voxel.clone()
+                    else:
+                        # 创建空的体素地图
+                        Nx, Ny, Nz = map(int, grid_size.tolist())
+                        voxel = torch.zeros((1, 1, Nx, Ny, Nz), device=env.device)
+                    # 跳过体素构建，直接使用已有的体素地图
+                    # 注意：后续代码仍会正常执行（动作、观测等）
+                
+                # 体素构建优化：使用增量更新或完全重建（仅在深度图非空时）
+                if depth.numel() > 0:
+                    if use_incremental_voxel and global_voxel is not None:
+                        # 增量更新全局体素地图
+                        global_voxel = update_voxel_from_depth(
+                            global_voxel=global_voxel,
+                            depth=depth,
+                            cam_T_w=cam_T_w,
+                            intrinsics=intr,
+                            grid_origin=grid_origin,
+                            grid_size=grid_size, # 体素数量 [Vx, Vy, Vz]
+                            voxel_res=voxel_res,# 体素分辨率 [2.0/Vx, 2.0/Vy, 2.0/Vz]
+                            max_range=env.max_range,
+                            subsample=4, # 像素采样步长
+                            decay_factor=cfg.get('voxel', {}).get('decay_factor', 0.95),
+                            device=env.device,
+                        )
+                        voxel = global_voxel.clone()  # 使用更新后的全局地图
+                    else:
+                        # 完全重建体素地图（原始方法）
+                        voxel = build_voxel_from_depth(
+                            depth=depth,
+                            cam_T_w=cam_T_w,
+                            intrinsics=intr,
+                            grid_origin=grid_origin,
+                            grid_size=grid_size,
+                            voxel_res=voxel_res,
+                            max_range=env.max_range,
+                            subsample=4,
+                            device=env.device,
+                        ) 
+                logger.log(f"体素处理前: {voxel.shape}")
+                # 辅助观测序列（传入体素地图用于障碍物距离计算）
+                aux = env.observe(voxel=voxel, grid_origin=grid_origin, voxel_res=voxel_res) 
+                
+                logger.log(f"辅助观测处理前: {aux.shape}")
             
             # 检查 aux 是否有无效值
             if torch.isnan(aux).any() or torch.isinf(aux).any():
@@ -477,16 +531,17 @@ def main():
                     logger.error(f"aux包含无效值: NaN={nan_count}, Inf={inf_count}")
                 aux = torch.where(torch.isnan(aux) | torch.isinf(aux), torch.zeros_like(aux), aux)
             
-            # 检查 voxel 是否有无效值
-            if torch.isnan(voxel).any() or torch.isinf(voxel).any():
-                if t == 0 and it == 1:  # 只在第一次打印
-                    nan_count = torch.isnan(voxel).sum().item()
-                    inf_count = torch.isinf(voxel).sum().item()
-                    logger.error(f"voxel包含无效值: NaN={nan_count}, Inf={inf_count}")
-                voxel = torch.where(torch.isnan(voxel) | torch.isinf(voxel), torch.zeros_like(voxel), voxel)
+            # 检查 voxel 是否有无效值（仅在非viewer模式下）
+            if not env.enable_viewer:
+                if torch.isnan(voxel).any() or torch.isinf(voxel).any():
+                    if t == 0 and it == 1:  # 只在第一次打印
+                        nan_count = torch.isnan(voxel).sum().item()
+                        inf_count = torch.isinf(voxel).sum().item()
+                        logger.error(f"voxel包含无效值: NaN={nan_count}, Inf={inf_count}")
+                    voxel = torch.where(torch.isnan(voxel) | torch.isinf(voxel), torch.zeros_like(voxel), voxel)
             
-            # 🎯 调试：保存第一步的voxel和aux
-            if t == 0 and it == 1:
+            # 🎯 调试：保存第一步的voxel和aux（仅在非viewer模式下，避免段错误）
+            if not env.enable_viewer and t == 0 and it == 1:
                 logger.log(f"voxel形状: {voxel.shape}")
                 logger.log(f"aux形状: {aux.shape}")
                 logger.save_state("voxel_first_step", voxel, iteration=it)
@@ -494,16 +549,19 @@ def main():
             
             # 🎯 统一体素处理：确保形状为 [num_envs, C, Vx, Vy, Vz]
             voxel = prepare_voxel_for_training(voxel, num_envs, voxel_shape)
-            logger.log(f"体素处理后: {voxel.shape}")
+            if not env.enable_viewer:  # 仅在非viewer模式下记录日志，避免段错误
+                logger.log(f"体素处理后: {voxel.shape}")
             
             # 🎯 统一辅助观测处理：确保形状为 [num_envs, aux_dim]
             aux = prepare_aux_for_training(aux, num_envs, aux_dim_val)
-            logger.log(f"辅助观测处理后: {aux.shape}")
+            if not env.enable_viewer:  # 仅在非viewer模式下记录日志，避免段错误
+                logger.log(f"辅助观测处理后: {aux.shape}")
             
-            a, logp, v = algo.act(voxel, aux) # 网络推理得到动作（批量处理）
+            # 🎯 动作集成策略：传递当前迭代信息
+            a, logp, v = algo.act(voxel, aux, current_episode=it, total_episodes=total_iters) # 网络推理得到动作（批量处理）
             
-            # 🎯 调试：检查动作和值
-            if t == 0 and it == 1:
+            # 🎯 调试：检查动作和值（仅在非viewer模式下，避免段错误）
+            if not env.enable_viewer and t == 0 and it == 1:
                 logger.log(f"动作形状: {a.shape}, 范围: [{a.min().item():.4f}, {a.max().item():.4f}]")
                 logger.log(f"logp形状: {logp.shape}, 范围: [{logp.min().item():.4f}, {logp.max().item():.4f}]")
                 logger.log(f"值形状: {v.shape}, 范围: [{v.min().item():.4f}, {v.max().item():.4f}]")
@@ -698,8 +756,26 @@ def main():
                 logp = logp.unsqueeze(0)
             if logp.shape[0] == num_envs:
                 logps[t] = logp
+                # 🎯 计算动作概率（用于自适应折扣因子）
+                # 对于连续动作空间，将logp转换为"策略质量"指标
+                # 方法：使用sigmoid将logp映射到[0,1]，作为策略质量指标
+                # 注意：GAE内部会将此值clip到[eta_min, eta_max]作为折扣因子
+                if use_adaptive_gamma:
+                    # 将logp归一化到[0,1]范围（使用sigmoid映射）
+                    # logp通常在[-10, 0]范围，sigmoid(logp/5.0)将其映射到[0,1]
+                    logp_normalized = torch.sigmoid(logp / 5.0)  # [0,1]范围，表示策略质量
+                    action_probs[t] = logp_normalized
             else:
-                logps[t, 0] = logp[0] if logp.shape[0] > 0 else logp
+                # 处理logp形状不匹配的情况
+                if logp.shape[0] > 0:
+                    logps[t, 0] = logp[0]
+                    if use_adaptive_gamma and action_probs is not None:
+                        action_probs[t, 0] = torch.sigmoid(logp[0] / 5.0)
+                else:
+                    # 如果logp为空，使用0作为默认值
+                    logps[t, 0] = 0.0
+                    if use_adaptive_gamma and action_probs is not None:
+                        action_probs[t, 0] = 0.5  # sigmoid(0/5.0) = 0.5
             
             if v.dim() == 0:
                 v = v.unsqueeze(0)
@@ -739,28 +815,39 @@ def main():
                 done_mask = done.bool()
                 if done_mask.any():
                     done_envs = torch.where(done_mask)[0].cpu().tolist()
+                    
+                    # 🎯 关键修复：只在环境首次进入done状态时计数，避免重复计数
+                    # 使用一个标志来跟踪哪些环境已经在这个rollout中被计数过
+                    if not hasattr(main, '_counted_envs_in_rollout'):
+                        main._counted_envs_in_rollout = set()
+                    
                     for env_idx in done_envs:
-                        episode_count += 1
-                        # 统计、打印、保存episode等
-                        # 获取episode结束原因
-                        success = info.get('success', False) if info else False
-                        timeout = info.get('timeout', False) if info else False
-                        collision_terminate = info.get('collision_terminate', False) if info else False
-                        
-                        # 处理success（可能是tensor或列表）
-                        if isinstance(success, torch.Tensor):
-                            success_val = success[env_idx].item() if success.shape[0] > env_idx else False
-                        elif isinstance(success, list):
-                            success_val = success[env_idx] if len(success) > env_idx else False
-                        else:
-                            success_val = success
-                        
-                        # 统计成功次数
-                        if success_val:
-                            success_count += 1
-                        
-                        # 打印episode结束信息（每10步或前5步）
-                        if (t + 1) % 10 == 0 or t < 5:
+                        # 检查该环境是否已经在这个rollout中被计数过
+                        env_key = (it, env_idx)
+                        if env_key not in main._counted_envs_in_rollout:
+                            # 首次计数，增加episode_count
+                            episode_count += 1
+                            main._counted_envs_in_rollout.add(env_key)
+                            
+                            # 统计、打印、保存episode等
+                            # 获取episode结束原因
+                            success = info.get('success', False) if info else False
+                            timeout = info.get('timeout', False) if info else False
+                            collision_terminate = info.get('collision_terminate', False) if info else False
+                            
+                            # 处理success（可能是tensor或列表）
+                            if isinstance(success, torch.Tensor):
+                                success_val = success[env_idx].item() if success.shape[0] > env_idx else False
+                            elif isinstance(success, list):
+                                success_val = success[env_idx] if len(success) > env_idx else False
+                            else:
+                                success_val = success
+                            
+                            # 统计成功次数
+                            if success_val:
+                                success_count += 1
+                            
+                            # 打印episode结束信息（总是打印，因为这是episode结束）
                             termination_reason = info.get('termination_reason', None) if info else None
                             success_reason = info.get('success_reason', None) if info else None
                             
@@ -772,41 +859,47 @@ def main():
                             else:
                                 term_reason = termination_reason
                             
-                            # 处理success_reason
-                            if isinstance(success_reason, list) and len(success_reason) > env_idx:
-                                succ_reason = success_reason[env_idx]
-                            elif isinstance(success_reason, list):
-                                succ_reason = success_reason[0] if len(success_reason) > 0 else None
+                            # 处理success_reason（优先使用success_reason，如果没有则使用termination_reason）
+                            if success_val:
+                                if isinstance(success_reason, list) and len(success_reason) > env_idx:
+                                    succ_reason = success_reason[env_idx]
+                                elif isinstance(success_reason, list):
+                                    succ_reason = success_reason[0] if len(success_reason) > 0 else None
+                                else:
+                                    succ_reason = success_reason
+                                # 如果success_reason为空，使用termination_reason
+                                if succ_reason is None:
+                                    succ_reason = term_reason
                             else:
-                                succ_reason = success_reason
+                                succ_reason = None
                             
                             # 构建原因字符串
                             if success_val:
-                                reason_str = f" (成功: {succ_reason})"
+                                reason_str = f" (成功: {succ_reason})" if succ_reason else " (成功)"
                             elif isinstance(collision_terminate, torch.Tensor) and collision_terminate.shape[0] > env_idx and collision_terminate[env_idx]:
-                                reason_str = f" (碰撞终止: {term_reason})"
+                                reason_str = f" (碰撞终止: {term_reason})" if term_reason else " (碰撞终止)"
                             elif isinstance(timeout, torch.Tensor) and timeout.shape[0] > env_idx and timeout[env_idx]:
                                 reason_str = " (超时)"
                             else:
                                 reason_str = ""
                             
                             print(f"  -> Env {env_idx} Episode finished at step {t+1}, reward={episode_rewards[env_idx].item():.2f}, length={episode_lengths[env_idx].item()}{reason_str}")
-                        
-                        # 🎯 保存episode统计
-                        logger.save_episode(
-                            iteration=it,
-                            step=t+1,
-                            env_idx=env_idx,
-                            episode_reward=episode_rewards[env_idx].item(),
-                            episode_length=episode_lengths[env_idx].item(),
-                            success=success_val,
-                            termination_reason=str(term_reason) if 'term_reason' in locals() else None,
-                            success_reason=str(succ_reason) if 'succ_reason' in locals() else None
-                        )
-                        
-                        # 重置该环境的统计
-                        episode_rewards[env_idx] = 0.0
-                        episode_lengths[env_idx] = 0
+                            
+                            # 🎯 保存episode统计
+                            logger.save_episode(
+                                iteration=it,
+                                step=t+1,
+                                env_idx=env_idx,
+                                episode_reward=episode_rewards[env_idx].item(),
+                                episode_length=episode_lengths[env_idx].item(),
+                                success=success_val,
+                                termination_reason=str(term_reason) if term_reason else None,
+                                success_reason=str(succ_reason) if succ_reason else None
+                            )
+                            
+                            # 重置该环境的统计
+                            episode_rewards[env_idx] = 0.0
+                            episode_lengths[env_idx] = 0
                     
                     # 🎯 修复：为每个done的环境单独reset，而不是等所有环境都done
                     # 这样可以避免done的环境一直处于done状态，导致重复计数
@@ -870,7 +963,7 @@ def main():
             last_voxel = prepare_voxel_for_training(voxel, num_envs, voxel_shape)
             
             last_aux = env.observe(voxel=last_voxel, grid_origin=grid_origin, voxel_res=voxel_res)  # [num_envs, aux_dim]
-            _, _, last_values = algo.act(last_voxel, last_aux)  # last_values: [num_envs]
+            _, _, last_values = algo.act(last_voxel, last_aux, current_episode=it, total_episodes=total_iters)  # last_values: [num_envs]
             
             # 🎯 确保 last_values 形状正确
             if last_values.dim() == 0:
@@ -896,7 +989,12 @@ def main():
         next_values = torch.zeros_like(values)  # [T,N]
         next_values[:-1] = values[1:]  # [T-1, N] = values[1:T]
         next_values[-1] = last_values  # [N] = last_v for all environments at final step
-        adv, ret = gae(rewards, dones, values, next_values)
+        
+        # 🎯 自适应折扣因子：传递动作概率
+        if use_adaptive_gamma and action_probs is not None:
+            adv, ret = gae(rewards, dones, values, next_values, action_probs=action_probs)
+        else:
+            adv, ret = gae(rewards, dones, values, next_values)
 
         traj = {
             'voxel': voxels.view(-1, *voxel_shape),  # [T*N, C, Vx, Vy, Vz]

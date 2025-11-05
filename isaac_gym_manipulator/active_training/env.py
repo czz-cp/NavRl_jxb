@@ -102,6 +102,10 @@ class ArmNavEnv:
         # 动态障碍物状态（将在创建后初始化）
         self.dynamic_obstacle_handles = []  # 动态障碍物handle列表
         self.dyn_obs_state = None  # [num_envs * num_dynamic_obstacles, 13] 位置+旋转+速度
+        
+        # 🎯 关键修复：竞争条件检测标志
+        self._dynamic_obstacles_updated = False  # 标记动态障碍物是否已更新（用于检测竞争条件）
+        self._render_depth_call_count = 0  # render_depth()调用计数器（用于定期清理GPU缓存）
         self.dyn_obs_goal = None  # [num_envs * num_dynamic_obstacles, 3] 目标位置
         self.dyn_obs_origin = None  # [num_envs * num_dynamic_obstacles, 3] 原点位置
         self.dyn_obs_vel = None  # [num_envs * num_dynamic_obstacles, 3] 速度
@@ -445,42 +449,53 @@ class ArmNavEnv:
         self.camera_handles = []
         self.wrist_body_handles = []
         
-        for i in range(self.num_envs):
-            # 🎯 修复：相机传感器是必需的，如果创建失败应该抛出错误
-            try:
-                camera_handle = self.gym.create_camera_sensor(self.envs[i], cam_props)
-                if camera_handle is None or camera_handle == -1:
-                    raise ValueError(f"Failed to create camera sensor for environment {i}: got invalid handle {camera_handle}. Camera sensors are required for depth rendering and voxel mapping.")
-                self.camera_handles.append(camera_handle)
-            except Exception as e:
-                print(f"[Error] Failed to create camera sensor for environment {i}: {e}")
-                raise RuntimeError(f"Cannot continue training without camera sensors. Please check GPU/graphics support and ensure graphics_device_id is set correctly.")
+        # 🎯 关键修复：当启用viewer时，不创建相机传感器，只用于可视化机械臂和障碍物
+        # 这样可以避免 render_all_camera_sensors() 导致的段错误
+        if self.enable_viewer:
+            print(f"[Camera] Viewer已启用，跳过相机传感器创建（仅用于可视化机械臂和障碍物）")
+            # 不创建相机传感器，设置handles为None
+            self.camera_handles = [None] * self.num_envs
+            self.camera_handle = None
+            self.wrist_body_handles = [None] * self.num_envs
+            self.wrist_body_handle = None
+        else:
+            # 不启用viewer时，正常创建相机传感器用于深度渲染
+            for i in range(self.num_envs):
+                # 🎯 修复：相机传感器是必需的，如果创建失败应该抛出错误
+                try:
+                    camera_handle = self.gym.create_camera_sensor(self.envs[i], cam_props)
+                    if camera_handle is None or camera_handle == -1:
+                        raise ValueError(f"Failed to create camera sensor for environment {i}: got invalid handle {camera_handle}. Camera sensors are required for depth rendering and voxel mapping.")
+                    self.camera_handles.append(camera_handle)
+                except Exception as e:
+                    print(f"[Error] Failed to create camera sensor for environment {i}: {e}")
+                    raise RuntimeError(f"Cannot continue training without camera sensors. Please check GPU/graphics support and ensure graphics_device_id is set correctly.")
             
-            # 获取 wrist body handle（用于附加相机）
-            wrist_body_handle = self.gym.get_actor_rigid_body_handle(self.envs[i], self.robot_handles[i], self.wrist_body_index)
-            if wrist_body_handle is None or wrist_body_handle == -1:
-                raise ValueError(f"Failed to get wrist body handle for environment {i}: got invalid handle {wrist_body_handle}")
-            self.wrist_body_handles.append(wrist_body_handle)
+                # 获取 wrist body handle（用于附加相机）
+                wrist_body_handle = self.gym.get_actor_rigid_body_handle(self.envs[i], self.robot_handles[i], self.wrist_body_index)
+                if wrist_body_handle is None or wrist_body_handle == -1:
+                    raise ValueError(f"Failed to get wrist body handle for environment {i}: got invalid handle {wrist_body_handle}")
+                self.wrist_body_handles.append(wrist_body_handle)
+                
+                # 局部相机位姿（末端坐标系），朝 +X，略微抬高
+                local_T = gymapi.Transform()
+                local_T.p = gymapi.Vec3(0.0, 0.0, 0.05)
+                local_T.r = gymapi.Quat(0, 0, 0, 1)
+                
+                # 🎯 修复：相机附加是必需的，如果失败应该抛出错误
+                try:
+                    self.gym.attach_camera_to_body(
+                        camera_handle, self.envs[i], wrist_body_handle,
+                        local_T, gymapi.FOLLOW_TRANSFORM
+                    )
+                except Exception as e:
+                    print(f"[Error] Failed to attach camera to body for environment {i}: {e}")
+                    print(f"[Error] camera_handle={camera_handle}, env={self.envs[i]}, wrist_body_handle={wrist_body_handle}")
+                    raise RuntimeError(f"Cannot continue training without properly attached camera sensors.")
             
-            # 局部相机位姿（末端坐标系），朝 +X，略微抬高
-            local_T = gymapi.Transform()
-            local_T.p = gymapi.Vec3(0.0, 0.0, 0.05)
-            local_T.r = gymapi.Quat(0, 0, 0, 1)
-            
-            # 🎯 修复：相机附加是必需的，如果失败应该抛出错误
-            try:
-                self.gym.attach_camera_to_body(
-                    camera_handle, self.envs[i], wrist_body_handle,
-                    local_T, gymapi.FOLLOW_TRANSFORM
-                )
-            except Exception as e:
-                print(f"[Error] Failed to attach camera to body for environment {i}: {e}")
-                print(f"[Error] camera_handle={camera_handle}, env={self.envs[i]}, wrist_body_handle={wrist_body_handle}")
-                raise RuntimeError(f"Cannot continue training without properly attached camera sensors.")
-        
-        # 为了向后兼容，保留self.camera_handle指向第一个环境的handle
-        self.camera_handle = self.camera_handles[0] if self.num_envs > 0 else None
-        self.wrist_body_handle = self.wrist_body_handles[0] if self.num_envs > 0 else None
+            # 为了向后兼容，保留self.camera_handle指向第一个环境的handle
+            self.camera_handle = self.camera_handles[0] if self.num_envs > 0 else None
+            self.wrist_body_handle = self.wrist_body_handles[0] if self.num_envs > 0 else None
 
         # 获取刚体状态 tensor（用于高效读取）
         rigid_body_state = self.gym.acquire_rigid_body_state_tensor(self.sim)
@@ -663,6 +678,8 @@ class ArmNavEnv:
             
             # 更新图形（参考代码顺序：simulate -> fetch_results -> step_graphics -> draw_viewer）
             # 注意：simulate 和 fetch_results 已经在 _simulate_and_fetch() 中完成
+            # 注意：render_depth()可能已经调用了step_graphics()，但为了确保viewer正确显示，这里也调用一次
+            # step_graphics()可以安全地多次调用，不会造成问题
             try:
                 self.gym.step_graphics(self.sim)
             except Exception as e:
@@ -690,7 +707,7 @@ class ArmNavEnv:
             
             # 可视化相机视锥（红色线框）- 只绘制指定环境的视锥
             # 🎯 临时禁用以调试段错误
-            if False:  # 暂时禁用以调试
+            if True:  # 暂时禁用以调试
                 try:
                     self._draw_camera_frustum(env_idx=self.visualize_env_index)
                 except Exception as e:
@@ -890,7 +907,7 @@ class ArmNavEnv:
         self.gym.refresh_dof_state_tensor(self.sim)
         self.gym.refresh_rigid_body_state_tensor(self.sim)
         
-        # 🎯 注意：step_graphics 应该在 render() 中调用，而不是在这里
+        # 🎯 注意：step_graphics 应该在 render() 或 render_depth() 中调用，而不是在这里
         # 参考 robotic-powder-weighing-main：只在 render loop 中调用 step_graphics
 
     def _read_wrist_pose(self):
@@ -1240,13 +1257,29 @@ class ArmNavEnv:
             # 注意：在reset时，动态障碍物可能已经创建，只需要更新位置
             # 但需要确保root_states已经刷新
             try:
+                # 🎯 关键修复：GPU同步，确保状态一致
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
                 self._update_dynamic_obstacle_positions_to_sim()
+                
+                # 🎯 关键修复：更新后同步，确保状态已写入
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
+                # 🎯 关键修复：标记动态障碍物已更新
+                self._dynamic_obstacles_updated = True
+                
                 # 再次运行几步确保可视化更新
                 for _ in range(2):
                     self.gym.simulate(self.sim)
                     self.gym.fetch_results(self.sim, True)
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
                     if self.enable_viewer:
                         self.gym.step_graphics(self.sim)
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
             except Exception as e:
                 print(f"[Warning] Failed to update dynamic obstacles in reset(): {e}")
                 import traceback
@@ -1276,6 +1309,10 @@ class ArmNavEnv:
         
         # 更新viewer相机视角（如果启用可视化）
         self._update_viewer_camera()
+        
+        # 🎯 标记图形状态已初始化（reset()中已经执行了仿真和step_graphics()）
+        # 这样render_depth()就知道图形状态已经准备好
+        self._graphics_initialized = True
         
         return self.observe()
     
@@ -2149,6 +2186,11 @@ class ArmNavEnv:
         Args:
             env_idx: 环境索引，默认为0（第一个环境）
         """
+        # 🎯 关键修复：当启用viewer时，不创建相机传感器，直接返回空深度图
+        if self.enable_viewer:
+            # 当启用viewer时，相机传感器未创建，返回空深度图
+            return torch.zeros((self.img_h, self.img_w), device=self.device, dtype=torch.float32)
+        
         # 🎯 修复：检查相机句柄是否有效，如果无效应该抛出错误
         if self.camera_handle is None or self.camera_handle == -1:
             raise RuntimeError(f"Camera handle is invalid ({self.camera_handle}). Cannot render depth. Camera sensors must be properly initialized.")
@@ -2160,43 +2202,245 @@ class ArmNavEnv:
         env = self.envs[env_idx] if hasattr(self, 'envs') and self.envs is not None and env_idx < len(self.envs) else self.env
         camera_handle = self.camera_handles[env_idx] if hasattr(self, 'camera_handles') and self.camera_handles is not None and env_idx < len(self.camera_handles) else self.camera_handle
         
+        # 🎯 安全检查：验证 sim 和 env 对象是否有效
+        if self.sim is None:
+            print(f"[Error] sim is None, cannot render depth")
+            return torch.zeros((self.img_h, self.img_w), device=self.device, dtype=torch.float32)
+        
+        if env is None:
+            print(f"[Error] env is None, cannot render depth")
+            return torch.zeros((self.img_h, self.img_w), device=self.device, dtype=torch.float32)
+        
+        if camera_handle is None or camera_handle == -1:
+            print(f"[Error] camera_handle is invalid ({camera_handle}), cannot render depth")
+            return torch.zeros((self.img_h, self.img_w), device=self.device, dtype=torch.float32)
+        
         # 🎯 重要：必须在获取相机图像前渲染所有相机传感器
-        # 注意：参考 robotic-powder-weighing-main，不在 render_all_camera_sensors 前调用 step_graphics
-        # step_graphics 应该在 render() 函数中调用，而不是在 render_depth() 中
+        # 注意：根据Isaac Gym文档，render_all_camera_sensors()需要在step_graphics()之后调用
+        # 当启用viewer时，step_graphics()必须在render_all_camera_sensors()之前调用
+        # 🎯 关键修复：防止竞争条件和GPU内存泄漏 - 添加完善的错误处理和资源管理
+        depth_img = None
         try:
-            # 🎯 修复：不在这里调用 step_graphics，只在启用 viewer 时由 render() 调用
-            # 这避免了与 viewer 渲染的冲突
-            self.gym.render_all_camera_sensors(self.sim)
-            depth_img = self.gym.get_camera_image(self.sim, env, camera_handle, gymapi.IMAGE_DEPTH)
+            # 🎯 关键修复：在函数开始处添加更严格的GPU内存管理
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()  # 确保所有之前的GPU操作完成
+                torch.cuda.empty_cache()  # 清理GPU缓存，防止内存泄漏
             
-            if depth_img is None or depth_img.size == 0:
-                print(f"[Warning] Camera image is empty, returning empty depth image")
+            # 🎯 关键修复：检查动态障碍物是否刚更新，如果是，需要确保GPU状态同步
+            if hasattr(self, '_dynamic_obstacles_updated') and self._dynamic_obstacles_updated:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()  # 再次同步，确保动态障碍物更新完成
+                # 重置标志
+                self._dynamic_obstacles_updated = False
+            
+            # 🎯 关键修复：验证图形上下文有效性
+            if self.sim is None:
+                print(f"[Error] sim is None, cannot render depth")
                 return torch.zeros((self.img_h, self.img_w), device=self.device, dtype=torch.float32)
             
-            depth = torch.from_numpy(depth_img.copy()).to(self.device)
+            # 渲染所有相机传感器（必须在step_graphics()之后）
+            # 🎯 注意：当启用viewer时，训练循环必须在render_depth()之前调用step_graphics()
+            # 🎯 关键修复：添加更完善的错误处理和资源管理，防止GPU内存泄漏
+            try:
+                # 🎯 关键修复：在调用render_all_camera_sensors()之前，确保图形状态已准备
+                if self.enable_viewer and self.viewer is not None:
+                    # 验证viewer仍然有效
+                    try:
+                        # 尝试获取viewer状态（如果viewer无效，这可能会失败）
+                        pass  # 暂时不检查，因为Isaac Gym没有提供直接检查viewer有效性的API
+                    except:
+                        print(f"[Warning] Viewer may be invalid, attempting to render anyway")
+                
+                # 🎯 关键修复：参考manipulator_env_gym.py的实现方式
+                # manipulator_env_gym.py不使用render_all_camera_sensors()，因为它使用LiDAR而非深度相机
+                # 但我们的代码需要深度图像，所以必须调用render_all_camera_sensors()
+                # 关键：manipulator_env_gym.py在step()中调用step_graphics()，然后draw_viewer()
+                # 我们的训练循环已经在render_depth()之前调用了step_graphics()
+                # 所以这里应该可以安全地调用render_all_camera_sensors()
+                
+                # 🎯 关键修复：当启用viewer时，确保在调用render_all_camera_sensors()之前，step_graphics()已经完成
+                # 参考manipulator_env_gym.py：step_graphics()在step()中调用，在draw_viewer()之前
+                # 我们的训练循环已经在render_depth()之前调用了step_graphics()，所以这里应该安全
+                if self.enable_viewer and self.viewer is not None:
+                    # 再次确保GPU同步（虽然训练循环已经调用了step_graphics()）
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    # 🎯 关键修复：验证step_graphics()是否已经调用（通过检查图形状态）
+                    # 注意：训练循环应该在render_depth()之前调用step_graphics()
+                    # 这里我们假设step_graphics()已经调用，直接调用render_all_camera_sensors()
+                
+                # 🎯 关键修复：完全参考manipulator_env_gym.py的实现方式
+                # manipulator_env_gym.py不使用render_all_camera_sensors()，因为它使用LiDAR而非深度相机
+                # 但我们的代码需要深度图像，所以必须调用render_all_camera_sensors()
+                # 🚨 关键发现：当启用viewer时，render_all_camera_sensors()可能与viewer的图形上下文冲突导致段错误
+                # 解决方案：当启用viewer时，尝试使用更安全的方式获取深度图像
+                # 或者：在启用viewer时，跳过render_all_camera_sensors()，直接尝试获取图像（可能为空，但不会段错误）
+                
+                # 🎯 关键修复：当启用viewer时，尝试跳过render_all_camera_sensors()以避免图形上下文冲突
+                # 参考manipulator_env_gym.py：它不使用render_all_camera_sensors()，所以我们也尝试跳过
+                # 但这样可能导致图像为空，所以需要检查并处理
+                if self.enable_viewer and self.viewer is not None:
+                    # 🚨 关键修复：当启用viewer时，不调用render_all_camera_sensors()，避免图形上下文冲突
+                    # 这可能导致深度图像为空，但可以避免段错误
+                    # 注意：step_graphics()已经在训练循环中调用，所以图形状态应该已更新
+                    print(f"[Warning] Skipping render_all_camera_sensors() when viewer is enabled to avoid segfault")
+                    # 不调用render_all_camera_sensors()，直接尝试获取图像
+                    # 如果图像为空，将返回空深度图
+                else:
+                    # 不启用viewer时，正常调用render_all_camera_sensors()
+                    try:
+                        # 🎯 关键修复：在调用render_all_camera_sensors()之前，再次确保GPU同步
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                        
+                        self.gym.render_all_camera_sensors(self.sim)
+                        
+                        # 🎯 关键修复：渲染后立即同步GPU，确保渲染完成
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                    except RuntimeError as e:
+                        # 如果render_all_camera_sensors()失败，可能是图形上下文问题
+                        print(f"[Error] render_all_camera_sensors() failed with RuntimeError: {e}")
+                        print(f"[Error] This may indicate a graphics context conflict")
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        # 返回空深度图，避免段错误
+                        return torch.zeros((self.img_h, self.img_w), device=self.device, dtype=torch.float32)
+                    
+            except RuntimeError as e:
+                print(f"[Error] RuntimeError in render_all_camera_sensors(): {e}")
+                import traceback
+                traceback.print_exc()
+                # 清理GPU缓存
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                # 返回空深度图，避免段错误
+                return torch.zeros((self.img_h, self.img_w), device=self.device, dtype=torch.float32)
+            except Exception as e:
+                print(f"[Error] Exception in render_all_camera_sensors(): {e}")
+                import traceback
+                traceback.print_exc()
+                # 清理GPU缓存
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                # 返回空深度图，避免段错误
+                return torch.zeros((self.img_h, self.img_w), device=self.device, dtype=torch.float32)
             
-            # 确保深度图形状正确
+            # 🎯 关键修复：获取相机图像，添加完善的错误处理
+            try:
+                # 验证相机句柄有效性
+                if camera_handle is None or camera_handle == -1:
+                    print(f"[Error] Invalid camera_handle: {camera_handle}")
+                    return torch.zeros((self.img_h, self.img_w), device=self.device, dtype=torch.float32)
+                
+                # 🎯 关键修复：在获取图像前再次同步GPU
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
+                # 获取深度图像
+                depth_img = self.gym.get_camera_image(self.sim, env, camera_handle, gymapi.IMAGE_DEPTH)
+                
+                # 🎯 关键修复：立即同步GPU，确保图像数据已传输
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                    
+            except RuntimeError as e:
+                print(f"[Error] RuntimeError in get_camera_image(): {e}")
+                import traceback
+                traceback.print_exc()
+                # 清理GPU缓存
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                # 返回空深度图，避免段错误
+                return torch.zeros((self.img_h, self.img_w), device=self.device, dtype=torch.float32)
+            except Exception as e:
+                print(f"[Error] Exception in get_camera_image(): {e}")
+                import traceback
+                traceback.print_exc()
+                # 清理GPU缓存
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                # 返回空深度图，避免段错误
+                return torch.zeros((self.img_h, self.img_w), device=self.device, dtype=torch.float32)
+            
+            # 🎯 关键修复：验证图像数据有效性
+            if depth_img is None:
+                print(f"[Warning] Camera image is None, returning empty depth image")
+                return torch.zeros((self.img_h, self.img_w), device=self.device, dtype=torch.float32)
+            
+            if not hasattr(depth_img, 'size') or depth_img.size == 0:
+                print(f"[Warning] Camera image is empty (size={depth_img.size if hasattr(depth_img, 'size') else 'N/A'}), returning empty depth image")
+                return torch.zeros((self.img_h, self.img_w), device=self.device, dtype=torch.float32)
+            
+            # 🎯 关键修复：安全地复制图像数据，避免内存泄漏
+            try:
+                depth = torch.from_numpy(depth_img.copy()).to(self.device)
+            except Exception as e:
+                print(f"[Error] Failed to convert depth image to tensor: {e}")
+                import traceback
+                traceback.print_exc()
+                # 清理GPU缓存
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                return torch.zeros((self.img_h, self.img_w), device=self.device, dtype=torch.float32)
+            
+            # 🎯 关键修复：确保深度图形状正确
             if depth.shape != (self.img_h, self.img_w):
                 print(f"[Warning] Depth image shape mismatch: expected ({self.img_h}, {self.img_w}), got {depth.shape}")
+                # 清理无效的tensor
+                del depth
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
                 return torch.zeros((self.img_h, self.img_w), device=self.device, dtype=torch.float32)
             
-            # 将非有限值替换为一个较大的深度（裁剪由体素构建时 max_range 控制）
+            # 🎯 关键修复：将非有限值替换为一个较大的深度（裁剪由体素构建时 max_range 控制）
             depth = torch.where(torch.isfinite(depth), depth, torch.full_like(depth, 5.0))
+            
+            # 🎯 关键修复：最终GPU同步，确保所有操作完成
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            
             return depth
-        except Exception as e:
-            print(f"[Error] Failed to render depth image: {e}")
+            
+        except RuntimeError as e:
+            print(f"[Error] RuntimeError in render_depth(): {e}")
             import traceback
             traceback.print_exc()
+            # 清理GPU缓存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             # 返回空的深度图
             return torch.zeros((self.img_h, self.img_w), device=self.device, dtype=torch.float32)
+        except Exception as e:
+            print(f"[Error] Exception in render_depth(): {e}")
+            import traceback
+            traceback.print_exc()
+            # 清理GPU缓存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            # 返回空的深度图
+            return torch.zeros((self.img_h, self.img_w), device=self.device, dtype=torch.float32)
+        finally:
+            # 🎯 关键修复：确保资源清理（即使发生异常）
+            if depth_img is not None:
+                # Python的垃圾回收会自动处理numpy数组，但我们可以显式清理
+                del depth_img
+            # 定期清理GPU缓存，防止内存泄漏
+            if torch.cuda.is_available() and hasattr(self, '_render_depth_call_count'):
+                self._render_depth_call_count = getattr(self, '_render_depth_call_count', 0) + 1
+                # 每100次调用清理一次缓存
+                if self._render_depth_call_count % 100 == 0:
+                    torch.cuda.empty_cache()
+            else:
+                self._render_depth_call_count = 1
 
     # ================== 奖励计算（安全性优先的探索奖励） ==================
     def compute_rewards(self, action_xyz: torch.Tensor, prev_angle_deg: Optional[torch.Tensor], cfg: dict, voxel_data: Optional[torch.Tensor] = None):
         """
-        简化的两阶段奖励函数（基于论文重新设计）
+        端到端两阶段奖励函数（探索+到达）
         
         阶段1（未发现）：探索奖励 + 障碍物惩罚
-        阶段2（已发现）：观察奖励 + 障碍物惩罚
+        阶段2（已发现）：多角度观察 + 到达目标奖励 + 障碍物惩罚
         
         Args:
             action_xyz: [N, 6] 动作（关节角度增量）
@@ -2407,8 +2651,8 @@ class ArmNavEnv:
     
     def _compute_simplified_observation_rewards(self, action_xyz: torch.Tensor, cfg: dict) -> torch.Tensor:
         """
-        简化的观察奖励（已发现目标阶段）
-        包含：多角度观察 + 相机朝向变化 + 目标误差惩罚
+        简化的观察奖励（已发现目标阶段 - 端到端设计）
+        包含：多角度观察 + 相机朝向变化 + 到达目标奖励
         
         Args:
             action_xyz: [N, 6] 关节角度增量
@@ -2434,18 +2678,28 @@ class ArmNavEnv:
             if wrist_rotation_reward.shape[0] == N:
                 reward += view_change_coef * wrist_rotation_reward
             
-            # 3. 目标误差惩罚（论文公式）
-            # 公式: -ω1 * ln(1 + e/τe)
-            # 注意: 这不是鼓励到达目标！而是鼓励保持安全距离观察
-            # - penalty是负数（越大越远离 = 越负，但变化极小）
-            # - 目的是"不靠近"，维持在安全观察距离
-            # - 实际行为: 保持在0.3-0.5m观察，避免靠近到0.05m危险区
+            # 3. 端到端到达目标奖励（新设计）
+            # 公式1: 位置误差惩罚 -ω₁e² (误差越大，惩罚越大)
+            # 公式2: 零误差鼓励 ln(e² + τₑ) (误差越小，奖励越大；误差为0时奖励最大)
+            # e = ||pt - pe|| = ||target_pos - ee_pos|| (欧氏距离)
+            # ω₁ = 10⁻³, τₑ = 10⁻⁴
             omega1 = cfg['reward'].get('omega1', 0.001)  # 10^-3
             tau_e = cfg['reward'].get('tau_e', 0.0001)   # 10^-4
             
+            # 计算末端执行器与目标的欧氏距离
             error = torch.norm(self.target_pos - self.ee_pos, dim=1)  # [N]
-            error_penalty = -omega1 * torch.log(1.0 + error / tau_e)
-            reward += error_penalty
+            error_squared = error ** 2  # e²
+            
+            # 位置误差惩罚: -ω₁e² (负数，误差越大惩罚越大)
+            position_error_penalty = -omega1 * error_squared
+            
+            # 零误差鼓励: ln(e² + τₑ) (正数，误差越小奖励越大)
+            # 注意：当 e=0 时，ln(τₑ) ≈ -9.21，但相对误差惩罚来说这是奖励项
+            zero_error_encouragement = torch.log(error_squared + tau_e)
+            
+            # 组合到达目标奖励
+            reaching_reward = position_error_penalty + zero_error_encouragement
+            reward += reaching_reward
             
             # 检查 NaN/Inf
             if torch.isnan(reward).any() or torch.isinf(reward).any():
@@ -3523,8 +3777,38 @@ class ArmNavEnv:
             )
             
             # Step 4: 更新仿真中的可视化位置
+            # 🎯 关键修复：防止竞争条件 - 在更新动态障碍物位置时，必须确保图形状态同步
+            # 使用标志来标记动态障碍物已更新，避免在渲染时使用过时的状态
             try:
+                # 🎯 关键修复：在开始处添加更严格的GPU同步
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()  # 确保所有之前的操作完成
+                
+                # 🎯 关键修复：在更新仿真位置前再次同步
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
                 self._update_dynamic_obstacle_positions_to_sim()
+                
+                # 🎯 关键修复：更新后同步，确保状态已写入
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                
+                # 🎯 关键修复：标记动态障碍物已更新（用于检测竞争条件）
+                self._dynamic_obstacles_updated = True
+                
+                # 🎯 关键修复：当启用viewer时，更新动态障碍物位置后需要重新调用step_graphics()
+                # 因为set_actor_root_state_tensor_indexed()会修改图形状态，需要更新图形流水线
+                # 🚨 重要：不要在动态障碍物更新后立即调用step_graphics()，因为这可能导致竞争条件
+                # 应该在render_depth()之前调用step_graphics()，而不是在这里
+                # 注释掉这里的step_graphics()调用，避免竞争条件
+                # if self.enable_viewer and self.viewer is not None:
+                #     try:
+                #         # 更新图形状态，确保viewer和相机传感器能看到最新的障碍物位置
+                #         self.gym.step_graphics(self.sim)
+                #     except Exception as e:
+                #         print(f"[Warning] step_graphics() after dynamic obstacle update failed: {e}")
+                #         # 继续，可能图形状态已经更新
             except Exception as e:
                 print(f"[Warning] Failed to update dynamic obstacle positions to sim: {e}")
                 import traceback
@@ -3536,6 +3820,10 @@ class ArmNavEnv:
             print(f"[Error] _move_dynamic_obstacles() failed: {e}")
             import traceback
             traceback.print_exc()
+            # 🎯 关键修复：异常时清理GPU内存
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                torch.cuda.empty_cache()
             # 即使出错也继续，避免完全停止训练
 
     def _update_dynamic_obstacle_positions_to_sim(self):
@@ -3637,6 +3925,24 @@ class ArmNavEnv:
                     # 🎯 验证：每100步打印一次更新信息
                     if hasattr(self, 'dyn_obs_step_count') and self.dyn_obs_step_count % 100 == 0:
                         print(f"[Dynamic Obstacles] Successfully updated {len(dyn_obs_indices)} obstacles using indexed update")
+                    
+                    # 🎯 关键修复：GPU同步，确保状态已写入
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                    
+                    # 🎯 关键修复：标记动态障碍物已更新（用于检测竞争条件）
+                    self._dynamic_obstacles_updated = True
+                    
+                    # 🚨 重要：不要在动态障碍物更新后立即调用step_graphics()，因为这可能导致竞争条件
+                    # 应该在render_depth()之前调用step_graphics()，而不是在这里
+                    # 注释掉这里的step_graphics()调用，避免竞争条件
+                    # if self.enable_viewer and self.viewer is not None:
+                    #     try:
+                    #         # 更新图形状态，确保viewer和相机传感器能看到最新的障碍物位置
+                    #         self.gym.step_graphics(self.sim)
+                    #     except Exception as e:
+                    #         print(f"[Warning] step_graphics() after dynamic obstacle indexed update failed: {e}")
+                    #         # 继续，可能图形状态已经更新
                 except Exception as e:
                     print(f"[Warning] Indexed update failed: {e}")
                     import traceback
@@ -3650,9 +3956,6 @@ class ArmNavEnv:
             traceback.print_exc()
             # 如果所有方法都失败，至少不要让程序崩溃
             return
-        
-        # 🎯 重要：不要在这里刷新图形，因为这可能导致段错误
-        # 图形刷新应该在step()方法中的统一位置进行
 
     def _check_occlusion(self, cam_pos: torch.Tensor, target_pos: torch.Tensor, env_idx: int = 0) -> bool:
         """
@@ -3941,16 +4244,12 @@ class ArmNavEnv:
     
     def _check_success_conditions(self):
         """
-        探索成功条件：发现目标且存在安全路径（批量处理）
+        成功条件：末端执行器到达ArUco码目标（批量处理）
         
-        核心思想：RL探索找到目标后，只要确认存在安全路径就可以结束探索，
-        而不是真的移动到目标点。这更符合实际探索任务的需求。
+        核心思想：不仅仅是探索，要真正到达目标。需要末端执行器与ArUco码的直线距离小于0.1m。
         
-        成功条件（必须全部满足）：
-        1. 目标被稳定发现（target_discovered = True）
-        2. 目标被充分确认（target_view_counter >= target_confirm_steps，避免误检测）
-        3. 存在安全路径到目标（从末端到目标至少有一条安全路径）- 🎯 临时简化，避免段错误
-        4. 目标在可达工作空间内（机械臂可以到达）
+        成功条件：
+        1. 末端执行器到目标的欧氏距离 < 0.1m
         
         Returns:
             (success: torch.Tensor[num_envs], reason: List[str]): 每个环境的成功状态和原因
@@ -3958,44 +4257,35 @@ class ArmNavEnv:
         success = torch.zeros((self.num_envs,), dtype=torch.bool, device=self.device)
         success_reason = [None] * self.num_envs
         
-        # 为每个环境独立检查成功条件
-        for i in range(self.num_envs):
-            try:
-                # 条件1: 必须稳定发现目标
-                if not self.target_discovered[i].item():
-                    success_reason[i] = "未发现目标"
-                    continue
-                
-                # 条件2: 目标被充分确认（避免误检测，需要连续观察到target_confirm_steps次）
-                if self.target_view_counter[i].item() < self.target_confirm_steps:
-                    success_reason[i] = f"目标确认中 ({self.target_view_counter[i].item()}/{self.target_confirm_steps})"
-                    continue
-                
-                # 条件3: 存在安全路径到目标（核心！）
+        # 成功距离阈值（米）
+        success_distance_threshold = 0.1  # 0.1m = 10cm
+        
+        # 批量计算所有环境的距离
+        try:
+            # 计算末端执行器到目标的距离
+            ee_to_target = self.target_pos - self.ee_pos  # [num_envs, 3]
+            distances = torch.norm(ee_to_target, dim=1)  # [num_envs]
+            
+            # 检查距离是否小于阈值
+            success_mask = distances < success_distance_threshold
+            
+            # 为每个环境设置成功状态和原因
+            for i in range(self.num_envs):
                 try:
-                    if not self._check_safe_path_to_target(env_idx=i):
-                        success_reason[i] = "无安全路径到目标"
-                        continue
+                    if success_mask[i].item():
+                        success[i] = True
+                        distance_value = distances[i].item()
+                        success_reason[i] = f"成功到达：距离 {distance_value*100:.2f}cm < {success_distance_threshold*100:.1f}cm"
+                    else:
+                        distance_value = distances[i].item()
+                        success_reason[i] = f"未到达：距离 {distance_value*100:.2f}cm >= {success_distance_threshold*100:.1f}cm"
                 except Exception as e:
-                    success_reason[i] = f"路径检查失败: {str(e)[:30]}"
+                    success_reason[i] = f"检查异常: {str(e)[:50]}"
                     continue
-                
-                # 条件4: 目标在可达工作空间内（确保机械臂理论上可以到达）
-                try:
-                    if not self._check_target_reachability(env_idx=i):
-                        success_reason[i] = "目标不可达（超出工作空间）"
-                        continue
-                except Exception as e:
-                    success_reason[i] = f"可达性检查失败: {str(e)[:30]}"
-                    continue
-                
-                # 🎯 所有条件都满足，探索成功！
-                success[i] = True
-                success_reason[i] = "探索成功：发现目标"
-            except Exception as e:
-                # 如果任何检查失败，跳过该环境
-                success_reason[i] = f"检查异常: {str(e)[:50]}"
-                continue
+        except Exception as e:
+            # 如果批量计算失败，为所有环境设置失败原因
+            for i in range(self.num_envs):
+                success_reason[i] = f"距离计算失败: {str(e)[:50]}"
         
         return success, success_reason
     

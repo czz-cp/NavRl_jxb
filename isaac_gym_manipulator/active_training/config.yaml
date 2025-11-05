@@ -10,7 +10,7 @@ voxel:
 # env (Isaac Gym UR10e)
 env:
   num_envs: 2  # 支持多环境并行训练（建议4-16）
-  max_steps: 800
+  max_steps: 1200
   img_w: 640
   img_h: 480
   fov_deg: 87.0
@@ -22,7 +22,7 @@ env:
                                     # 例如: gpu_device_id: 1 表示使用GPU 1
   
   # Visualization settings
-  enable_viewer: false              # 启用 Isaac Gym 可视化窗口
+  enable_viewer: false             # 启用 Isaac Gym 可视化窗口
   camera_pos: [1.5, -1.5, 1.2]    # 视口相机位置 [x, y, z] - 从侧面/上方观看机械臂
   camera_target: [0.0, 0.0, 0.6]  # 视口相机目标 [x, y, z] - 看向机械臂中心略上方
   render_freq: 1                  # 渲染频率（每N步渲染一次，10=每10步渲染一次，降低频率以提高性能）
@@ -30,10 +30,6 @@ env:
   
   action_dim: 6                    # 关节角度增量维度 [dq1, dq2, dq3, dq4, dq5, dq6]（弧度）
   action_limit: 0.1                # 关节角度增量限制（弧度/步）- 增大以鼓励更大的动作幅度
-  # 注意：已移除两步缩放，直接输出关节角度增量
-  # linear_vel_scale: 0.3          # 已废弃（末端速度控制）
-  # angular_vel_scale: 0.5         # 已废弃（末端速度控制）
-  # joint_vel_scale: 0.2           # 已废弃（末端速度控制）
   
   # PD控制器参数（位置控制模式）
   # 前3个关节（shoulder_pan, shoulder_lift, elbow）
@@ -84,8 +80,11 @@ reward:
   # 障碍物惩罚（论文公式：ω2·Σψi）
   omega2: 0.1                    # 障碍物惩罚系数
   d_max: 0.05                    # 安全距离阈值（5cm）
-  # 目标误差惩罚（论文公式：-ω1*ln(1+e/τe)）
-  omega1: 0.001                  # 误差惩罚系数（10^-3）
+  # 端到端到达目标奖励（新设计）
+  # 1. 位置误差惩罚: -ω₁e²
+  # 2. 零误差鼓励: ln(e² + τₑ)
+  # e = ||pt - pe|| (末端执行器与目标的欧氏距离)
+  omega1: 0.001                  # 误差权重系数（10^-3）
   tau_e: 0.0001                  # 误差阈值（10^-4）
   
   # === 简化奖励参数 ===
@@ -93,53 +92,13 @@ reward:
   wrist_movement_coef: 2.0       # 末端平移奖励（避免静止）
   view_change_coef: 0.15         # 相机朝向变化奖励
   
-  # === 旧版兼容参数（保留但不使用） ===
-  # === 安全性奖励（最高优先级 - 渐进式安全奖励） ===
-  # 渐进式安全奖励：轻度碰撞惩罚，严重碰撞终止
-  near_obstacle_penalty: 2.0        # 危险接近惩罚（15cm内，渐进式）
-  hard_collision_penalty: 5.0       # 严重碰撞惩罚（3cm内，触发终止）
-  persistent_danger_penalty: 3.0    # 持续危险状态惩罚（连续30步危险，触发终止）
-  persistent_danger_threshold: 30  # 持续危险状态阈值（连续步数）
-  safe_distance_bonus: 0.5         # 安全距离奖励（30cm外）
-  # 感知一致性（学习目标）
-  accurate_perception_bonus: 0.1    # 准确感知奖励（误差<5cm）
-  bad_perception_penalty: 0.5       # 感知错误惩罚（误差>15cm）
-  cautious_behavior_bonus: 0.05     # 谨慎行为奖励（感知到危险但实际安全）
-  dangerous_ignorance_penalty: 0.5  # 危险无知惩罚（未感知到危险但实际危险）
-  # 其他安全约束
-  joint_limit_penalty: 0.3         # 关节极限惩罚
-  workspace_penalty: 0.2           # 工作空间边界惩罚
-  jerk_penalty: 0.3                 # 动作突变惩罚（降低以允许更大的动作幅度）
-  
-  # === 初期局部探索奖励 ===
-  local_exploration_phase: 300     # 局部探索阶段步数
-  small_movement_bonus: 1.0        # 小范围移动奖励
-  large_movement_penalty: 0.1     # 大范围移动惩罚（初期）
-  wrist_movement_bonus: 0.15       # 末端关节运动奖励
-  view_change_bonus: 5.0          # 视野变化奖励
-  
-  # === 后期全局探索奖励 ===
-  info_gain: 5.0                   # 信息增益（全局探索）
-  
-  # === 可达性奖励 ===
-  reachable_bonus: 0.05            # 可达区域奖励（靠近基座）
-  singularity_penalty: 0.2         # 奇异点惩罚
-  joint_balance_bonus: 0.1        # 关节平衡奖励
-  
-  # === 运动奖励 ===
-  movement_bonus: 0.5             # 基础运动奖励（避免静止）
-  # wrist_movement_coef: 已移到简化奖励参数（0.12 → 2.0）
-  exploration_pattern_bonus: 0.1    # 探索模式奖励（摆动、扫描）
-  
   # === 发现和多角度观察奖励 ===
   discovery_bonus: 100.0             # 目标发现奖励（一次性）
-  # 多角度观察奖励（发现后，鼓励多角度确认安全路径）
   new_angle_bonus: 0.2             # 新角度观察奖励（30度差异视为新角度）
   multiview_movement_bonus: 0.1    # 多角度观察时的运动奖励（末端摆动）
   multiview_continuation_bonus: 0.05  # 持续多角度观察奖励（前10步递增）
   angle_coverage_bonus: 0.15       # 多角度覆盖奖励（观察到4+个角度）
   multiview_angle_threshold: 30.0  # 新角度阈值（度，小于此值视为同一角度）
-  camera_view_change_bonus: 0.15   # 相机朝向变化奖励（鼓励多角度观察）
   
   # === 末端转动奖励（在未知条件下，鼓励末端多角度探索） ===
   wrist_rotation_coef: 25.0        # 末端转动奖励系数（基础旋转奖励）- 进一步增大以鼓励更多旋转
@@ -149,15 +108,8 @@ reward:
   
   # === Z轴向上探索奖励（在未知条件下，鼓励向上探索） ===
   upward_exploration_coef: 10.0    # Z轴向上探索奖励系数
-  upward_exploration_threshold: 0.01  # 最小向上移动阈值（米，小于此值不奖励）- 修复：从0.3降低到0.01以更容易触发奖励
+  upward_exploration_threshold: 0.01  # 最小向上移动阈值（米，小于此值不奖励）
   upward_exploration_max_reward_height: 1.0  # 最大奖励的高度阈值（米，超过此高度不再额外奖励）
-  
-  # === 旧版本兼容（保留但不使用） ===
-  revisit_penalty: 1.0             # 重复访问惩罚（保留）
-  large_step_penalty: 0.5         # 大步长惩罚（保留，但初期被local_exploration覆盖）
-  obstacle_near_penalty: 2.0      # 障碍物接近惩罚（保留，但被collision_penalty覆盖）
-  angle_coef: 0.3
-  angle_cap_deg: 10.0
 
 # ppo
 ppo:
@@ -166,7 +118,6 @@ ppo:
   gae_lambda: 0.95
   clip_eps: 0.2
   entropy_coef: 0.01
-  value_coef: 0.1           # 不再使用（参考isaac-training：loss直接相加）
   max_grad_norm: 5.0        # 参考isaac-training使用5.0（实际在代码中硬编码）
   lr: 0.0001
   epochs: 5
@@ -179,17 +130,34 @@ ppo:
   value_norm_beta: 0.995    # ValueNorm的beta值（越大更新越慢，isaac-training标准是0.995）
   
   # 学习率调度（可选，默认关闭）
-  use_lr_scheduler: false   # 是否启用学习率调度
+  use_lr_scheduler: true   # 是否启用学习率调度
   lr_decay_steps: 1000      # 学习率衰减步数（CosineAnnealingLR）
   
   # 分离学习率（可选，默认与lr相同）
   feature_lr: 0.0001       # Feature extractor学习率
   actor_lr: 0.0001          # Actor学习率
   critic_lr: 0.0001         # Critic学习率（降低以稳定训练）
+  
+  # 动作集成策略（泊松分布采样）
+  use_action_ensemble: true  # 是否启用动作集成策略（默认关闭）
+  ensemble_alpha: 12.0        # 泊松分布参数α（默认12）
+  # 设计原理：
+  # - β = 1 + α * (current_episode / total_episodes)
+  # - 训练初期：en/ea ≈ 0 → β ≈ 1 → 采样次数少 → 探索性强
+  # - 训练后期：en/ea ≈ 1 → β ≈ 1+α → 采样次数多 → 利用性强
+  
+  # 自适应折扣因子（基于策略概率）
+  use_adaptive_gamma: true   # 是否启用自适应折扣因子（默认关闭）
+  eta_min: 0.6              # 最小折扣因子（策略不确定时使用）
+  eta_max: 0.99             # 最大折扣因子（策略自信时使用）
+  # 设计原理：
+  # - γ(s, a; η) = clip(π(s, a), η_min, η_max)
+  # - 当 π(s,a) 高时: γ ≈ η_max → 关注长期回报（策略自信）
+  # - 当 π(s,a) 低时: γ ≈ η_min → 关注即时奖励（策略不确定）
 
 # train
 train:
   total_iterations: 5000
   log_interval: 10
-  save_interval: 500
+  save_interval: 100
   checkpoint_dir: checkpoints_active_training

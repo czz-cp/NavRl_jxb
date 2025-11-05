@@ -278,30 +278,85 @@ def update_voxel_from_depth(
 class GAE:
     """
     Generalized Advantage Estimation (仿照 isaac-training)
+    支持自适应折扣因子（基于策略概率）
+    
+    [T, N]  # 时间步长 × 并行环境数
     输入:
       rewards: [T, N]
       dones:   [T, N]  (bool)
       values:  [T, N]
       next_values: [T, N] 或 [N]（t=T-1 时的 next_v）
+      action_probs: [T, N] (可选) 动作概率，用于自适应折扣因子
     输出:
       adv, ret: [T, N]
     """
-    def __init__(self, gamma: float = 0.99, lam: float = 0.95, device: Optional[torch.device] = None):
-        self.gamma = gamma
+    def __init__(self, gamma: float = 0.99, lam: float = 0.95, device: Optional[torch.device] = None,
+                 use_adaptive_gamma: bool = False, eta_min: float = 0.6, eta_max: float = 0.99):
+        self.gamma = gamma  # 固定折扣因子（当use_adaptive_gamma=False时使用）
         self.lam = lam
         self.device = device
+        self.use_adaptive_gamma = use_adaptive_gamma
+        self.eta_min = eta_min  # 最小折扣因子
+        self.eta_max = eta_max  # 最大折扣因子
+    
+    def _adaptive_discount_factor(self, action_prob: torch.Tensor) -> torch.Tensor:
+        """
+        基于策略概率的自适应折扣因子
+        
+        公式: γ(s, a; η) = clip(π(s, a), η_min, η_max)
+        
+        Args:
+            action_prob: [N] 动作概率（策略质量）
+        
+        Returns:
+            gamma: [N] 自适应折扣因子
+        """
+        # 策略概率反映了动作的"质量"
+        # 裁剪到合理范围 [η_min, η_max]
+        gamma = torch.clamp(action_prob, self.eta_min, self.eta_max)
+        return gamma
 
-    def __call__(self, rewards: torch.Tensor, dones: torch.Tensor, values: torch.Tensor, next_values: torch.Tensor):
+    def __call__(self, rewards: torch.Tensor, dones: torch.Tensor, values: torch.Tensor, 
+                 next_values: torch.Tensor, action_probs: Optional[torch.Tensor] = None):
         T, N = rewards.shape
         device = rewards.device
         adv = torch.zeros_like(rewards)
         ret = torch.zeros_like(rewards)
         last_adv = torch.zeros(N, device=device)
+        
         for t in reversed(range(T)):
-            nv = next_values if next_values.dim() == 1 else next_values[t]
+            # nv: [N] - 每个环境的下一个状态价值
+            # next_values应该是[T, N]格式，但为了兼容性也支持1D格式
+            if next_values.dim() == 1:
+                # 如果是1D，说明是最后一个状态的值（适用于所有时间步）
+                nv = next_values
+            else:
+                # 2D格式[T, N]，直接索引
+                nv = next_values[t]  # [N]
+            
             not_done = (~dones[t]).float()
-            delta = rewards[t] + self.gamma * nv * not_done - values[t]
-            last_adv = delta + self.gamma * self.lam * not_done * last_adv
+            
+            # 🎯 自适应折扣因子（如果启用）
+            if self.use_adaptive_gamma and action_probs is not None:
+                # 确保action_probs形状正确
+                if action_probs.shape[0] == T and action_probs.shape[1] == N:
+                    # 计算当前时间步的自适应折扣因子
+                    gamma_t = self._adaptive_discount_factor(action_probs[t])  # [N]
+                else:
+                    # 如果形状不匹配，使用固定折扣因子（降级处理）
+                    print(f"[GAE] Warning: action_probs shape mismatch: {action_probs.shape}, expected [{T}, {N}], using fixed gamma")
+                    gamma_t = torch.full((N,), self.gamma, device=device)
+            else:
+                # 使用固定折扣因子
+                gamma_t = torch.full((N,), self.gamma, device=device)
+            
+            # 计算TD误差 δ = r + γ(s,a) * V(s') - V(s)
+            delta = rewards[t] + gamma_t * nv * not_done - values[t]
+            
+            # 计算优势函数（使用自适应折扣因子）
+            # A(s,a) = δ + γ(s,a) * λ * A(s',a')
+            last_adv = delta + gamma_t * self.lam * not_done * last_adv
             adv[t] = last_adv
             ret[t] = adv[t] + values[t]
+        
         return adv, ret

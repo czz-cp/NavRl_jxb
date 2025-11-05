@@ -1414,7 +1414,7 @@ class ManipulatorEnvGym:
             self.prev_pose_error[navigation_mask] = pose_error[navigation_mask]
             
             # 到达目标奖励（使用简单欧几里得距离判断）
-        distance = torch.norm(ee_pos - self.target_pos, dim=1)
+            distance = torch.norm(ee_pos - self.target_pos, dim=1)
             reached_mask = navigation_mask & (distance < 0.1)
             navigation_reward[reached_mask] += reward_reach_bonus
             

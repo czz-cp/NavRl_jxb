@@ -25,11 +25,22 @@ class EfficientVoxelBackbone3D(nn.Module):
         super().__init__()
         
         # 🎯 阶段1: 基础特征 [32→16]
+        # 输入: [B, 1, 32, 32, 32] 
+        # 输出: [B, 32, 16, 16, 16]
+        # 空间分辨率: 32³ → 16³ (8倍体积减少)
+        # 特征通道: 1 → 32 (32倍特征丰富度)
         self.stage1 = nn.Sequential(
             nn.Conv3d(in_channels, 32, 3, stride=2, padding=1),  # 下采样
-            nn.BatchNorm3d(32),
+            # 卷积层：从 1 通道输入到 32 通道输出
+            # 3x3 卷积核，步长 2，填充 1（保持空间分辨率）
+            # 输出特征图：[B, 32, 16, 16, 16]
+            # 批归一化 + 激活
+            nn.BatchNorm3d(32), # 对32个通道的3D特征图进行批归一化
             nn.ELU(inplace=True),
             nn.Conv3d(32, 32, 3, padding=1),  # 特征增强
+            # 卷积层：从 32 通道输入到 32 通道输出
+            # 3x3 卷积核，填充 1（保持空间分辨率）
+            # 输出特征图：[B, 32, 16, 16, 16]
             nn.BatchNorm3d(32),
             nn.ELU(inplace=True),
         )  # 输出: [B, 32, 16, 16, 16]
@@ -104,9 +115,9 @@ class EfficientVoxelBackbone3D(nn.Module):
         x = F.elu(x, inplace=True)  # [B, 64, 8, 8, 8]
         
         # 全局池化 + 特征压缩
-        x = self.global_pool(x)  # [B, 64, 1, 1, 1]
-        x = x.view(x.size(0), -1)  # [B, 64]
-        x = self.output_proj(x)  # [B, 128]
+        x = self.global_pool(x)  # [B, 64, 1, 1, 1] 只是对现有特征进行下采样，不创造新特征
+        x = x.view(x.size(0), -1)  # [B, 64]  ↓ 展平
+        x = self.output_proj(x)  # [B, 128] 投影：从原始特征学到更高级的抽象特征
         
         # 输出检查
         if torch.isnan(x).any() or torch.isinf(x).any():
@@ -139,8 +150,8 @@ class ActorHeadGaussian(nn.Module):
             nn.Linear(in_dim, 128),
             nn.ELU(inplace=True),
             nn.BatchNorm1d(128),
-            nn.Dropout(0.1),
-            
+            nn.Dropout(0.1), # 10%的神经元被丢弃
+
             nn.Linear(128, 64),
             nn.ELU(inplace=True),
             nn.BatchNorm1d(64),
@@ -312,7 +323,7 @@ class PPO:
     def __init__(self, cfg, obs_shapes, action_dim, device):
         self.cfg = cfg
         self.device = device
-        voxel_shape, aux_dim = obs_shapes
+        voxel_shape, aux_dim = obs_shapes #18
         voxel_channels = voxel_shape[0]
         
         # 动作缩放参数（从env配置读取，如果没有则使用默认值）
@@ -365,7 +376,7 @@ class PPO:
         # PPO hyperparams
         self.clip_eps = cfg['clip_eps']
         self.entropy_coef = cfg['entropy_coef']
-        self.value_coef = cfg['value_coef']
+        self.value_coef = cfg.get('value_coef', 0.0)  # 保留兼容性，但实际不使用（参考isaac-training：loss直接相加）
         self.max_grad_norm = cfg['max_grad_norm']
         self.epochs = cfg['epochs']
         self.batch_size = cfg['batch_size']
@@ -380,6 +391,10 @@ class PPO:
         # 训练稳定性参数
         self.target_kl = cfg.get('target_kl', 0.02)  # KL早停阈值
         self.adv_clip = cfg.get('adv_clip', 10.0)  # Advantage裁剪范围
+        
+        # 动作集成策略参数（泊松分布）
+        self.use_action_ensemble = cfg.get('use_action_ensemble', False)  # 是否启用动作集成
+        self.ensemble_alpha = cfg.get('ensemble_alpha', 12.0)  # 泊松分布参数α（默认12）
         
         # 学习率调度器（可选）
         if cfg.get('use_lr_scheduler', False):
@@ -439,10 +454,92 @@ class PPO:
         
         return fused
 
+    def _action_ensemble_policy(self, fused, mean, std, current_episode, total_episodes):
+        """
+        基于泊松分布的动作集成策略
+        
+        设计原理：
+        - 训练初期：采样次数少（β≈1），更随机，探索性强
+        - 训练后期：采样次数多（β≈1+α），更平均，利用性强
+        
+        Args:
+            fused: [batch, feat_dim] 融合后的特征
+            mean: [batch, action_dim] 策略均值
+            std: [batch, action_dim] 策略标准差
+            current_episode: 当前episode/iteration
+            total_episodes: 总episode/iteration数
+            
+        Returns:
+            action: [batch, action_dim] 集成后的动作
+            logp: [batch] 动作的对数概率（平均）
+        """
+        batch_size = mean.shape[0]
+        action_dim = mean.shape[1]
+        device = mean.device
+        
+        # 1. 计算泊松分布均值β（基于训练进度，所有batch共享）
+        # β = 1 + α * (current_episode / total_episodes)
+        progress = float(current_episode) / max(float(total_episodes), 1.0)  # 避免除零
+        beta_value = 1.0 + float(self.ensemble_alpha) * progress
+        beta_value = max(1.0, min(float(self.ensemble_alpha), beta_value))  # 限制在[1, α]范围内
+        
+        # 2. 从泊松分布采样集成数量i（为每个batch独立采样）
+        poisson_dist = torch.distributions.Poisson(torch.tensor(beta_value, device=device))
+        i_samples = poisson_dist.sample((batch_size,))  # [batch] 每个样本一个采样次数
+        i_samples = torch.clamp(i_samples, min=1.0, max=float(self.ensemble_alpha)).long()  # 确保至少1次，最多α次
+        
+        # 3. 为每个样本采样i个动作并计算平均
+        actions_list = []
+        logps_list = []
+        
+        for b in range(batch_size):
+            i = int(i_samples[b].item())
+            batch_actions = []
+            batch_logps = []
+            
+            # 从高斯策略采样i个动作
+            dist = torch.distributions.Normal(mean[b:b+1], std[b:b+1])  # [1, action_dim]
+            
+            for j in range(i):
+                # 采样动作
+                action_raw_j = dist.rsample()  # [1, action_dim]
+                action_tanh_j = torch.tanh(action_raw_j)  # [1, action_dim]
+                action_j = action_tanh_j * self.action_limit  # [1, action_dim]
+                
+                # 计算log_prob
+                logp_raw_j = dist.log_prob(action_raw_j).sum(-1)  # [1]
+                tanh_correction_j = torch.log(1.0 - action_tanh_j.pow(2) + 1e-6).sum(-1)  # [1]
+                logp_j = logp_raw_j - tanh_correction_j  # [1]
+                
+                batch_actions.append(action_j)
+                batch_logps.append(logp_j)
+            
+            # 4. 计算平均动作和平均logp
+            batch_actions_tensor = torch.cat(batch_actions, dim=0)  # [i, action_dim]
+            batch_logps_tensor = torch.stack(batch_logps, dim=0)  # [i, 1]
+            
+            avg_action = batch_actions_tensor.mean(dim=0, keepdim=True)  # [1, action_dim]
+            avg_logp = batch_logps_tensor.mean(dim=0)  # [1]
+            
+            actions_list.append(avg_action)
+            logps_list.append(avg_logp)
+        
+        # 合并所有batch的结果
+        action = torch.cat(actions_list, dim=0)  # [batch, action_dim]
+        logp = torch.cat(logps_list, dim=0)  # [batch]
+        
+        return action, logp
+
     @torch.inference_mode()  # 比torch.no_grad()更高效，自动处理BatchNorm
-    def act(self, voxel, aux):
+    def act(self, voxel, aux, current_episode=None, total_episodes=None):
         """
         Actor输出动作（使用高斯分布，更适合机械臂控制）
+        
+        Args:
+            voxel: [batch, C, Vx, Vy, Vz] 体素数据
+            aux: [batch, aux_dim] 辅助信息
+            current_episode: 当前episode/iteration（用于动作集成）
+            total_episodes: 总episode/iteration数（用于动作集成）
         
         Returns:
             a: [batch, 6] 关节角度增量 [dq1, dq2, dq3, dq4, dq5, dq6]（弧度，已缩放）
@@ -468,24 +565,29 @@ class PPO:
         # 计算标准差
         std = torch.exp(log_std.clamp(-1.0, 1.0))  # 限制std范围 [0.368, 2.718] - 增大标准差范围以允许更大的探索
         
-        # 创建高斯分布（在无界空间）
-        dist = torch.distributions.Normal(mean, std)
-        
-        # 重参数化采样（支持梯度反向传播）
-        action_raw = dist.rsample()  # [batch, 6] ∈ 无界范围
-        
-        # 🎯 使用tanh将无界动作映射到有界范围 [-action_limit, action_limit]
-        # 这是标准PPO处理有界动作空间的方式（参考SAC、PPO论文）
-        action_tanh = torch.tanh(action_raw)  # [batch, 6] ∈ [-1, 1]
-        action = action_tanh * self.action_limit  # [batch, 6] ∈ [-action_limit, action_limit]
-        
-        # 🎯 计算log_prob（需要考虑tanh变换的雅可比行列式）
-        # log_prob = log_prob_gaussian - log(1 - tanh^2(action_raw)) * action_limit
-        # 这是因为 tanh 变换改变了概率密度
-        logp_raw = dist.log_prob(action_raw).sum(-1)  # 高斯分布的log_prob
-        # tanh的雅可比行列式修正项：log|d tanh(x)/dx| = log(1 - tanh^2(x))
-        tanh_correction = torch.log(1.0 - action_tanh.pow(2) + 1e-6).sum(-1)  # 避免log(0)
-        logp = logp_raw - tanh_correction  # 修正后的log_prob
+        # 🎯 动作集成策略（如果启用）
+        if self.use_action_ensemble and current_episode is not None and total_episodes is not None:
+            action, logp = self._action_ensemble_policy(fused, mean, std, current_episode, total_episodes)
+        else:
+            # 标准PPO采样（单次采样）
+            # 创建高斯分布（在无界空间）
+            dist = torch.distributions.Normal(mean, std)
+            
+            # 重参数化采样（支持梯度反向传播）
+            action_raw = dist.rsample()  # [batch, 6] ∈ 无界范围
+            
+            # 🎯 使用tanh将无界动作映射到有界范围 [-action_limit, action_limit]
+            # 这是标准PPO处理有界动作空间的方式（参考SAC、PPO论文）
+            action_tanh = torch.tanh(action_raw)  # [batch, 6] ∈ [-1, 1]
+            action = action_tanh * self.action_limit  # [batch, 6] ∈ [-action_limit, action_limit]
+            
+            # 🎯 计算log_prob（需要考虑tanh变换的雅可比行列式）
+            # log_prob = log_prob_gaussian - log(1 - tanh^2(action_raw)) * action_limit
+            # 这是因为 tanh 变换改变了概率密度
+            logp_raw = dist.log_prob(action_raw).sum(-1)  # 高斯分布的log_prob
+            # tanh的雅可比行列式修正项：log|d tanh(x)/dx| = log(1 - tanh^2(x))
+            tanh_correction = torch.log(1.0 - action_tanh.pow(2) + 1e-6).sum(-1)  # 避免log(0)
+            logp = logp_raw - tanh_correction  # 修正后的log_prob
         
         # 价值函数估计
         v = self.critic(fused)
