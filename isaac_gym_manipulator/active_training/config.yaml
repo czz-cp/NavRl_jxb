@@ -22,7 +22,7 @@ env:
                                     # 例如: gpu_device_id: 1 表示使用GPU 1
   
   # Visualization settings
-  enable_viewer: true             # 启用 Isaac Gym 可视化窗口
+  enable_viewer: false             # 启用 Isaac Gym 可视化窗口
   camera_pos: [1.5, -1.5, 1.2]    # 视口相机位置 [x, y, z] - 从侧面/上方观看机械臂
   camera_target: [0.0, 0.0, 0.6]  # 视口相机目标 [x, y, z] - 看向机械臂中心略上方
   render_freq: 1                  # 渲染频率（每N步渲染一次，10=每10步渲染一次，降低频率以提高性能）

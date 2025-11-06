@@ -1184,11 +1184,16 @@ def main():
         if it % cfg['train']['save_interval'] == 0:
             os.makedirs(cfg['train']['checkpoint_dir'], exist_ok=True)
             checkpoint = {
-                'backbone': algo.backbone.state_dict(),
                 'actor': algo.actor.state_dict(),
                 'critic': algo.critic.state_dict(),
                 'iteration': it,
             }
+            # 🎯 根据use_nav_style_features保存不同的特征提取器
+            if not use_nav_style_features:
+                checkpoint['backbone'] = algo.backbone.state_dict()
+            else:
+                checkpoint['lidar_cnn'] = algo.lidar_cnn.state_dict()
+                checkpoint['dyn_obs_mlp'] = algo.dyn_obs_mlp.state_dict()
             checkpoint_path = os.path.join(cfg['train']['checkpoint_dir'], f'policy_{it}.pt')
             torch.save(checkpoint, checkpoint_path)
             logger.log(f"模型已保存: {checkpoint_path}")
@@ -1197,11 +1202,16 @@ def main():
     # 保存最终模型
     os.makedirs(cfg['train']['checkpoint_dir'], exist_ok=True)
     final_checkpoint = {
-        'backbone': algo.backbone.state_dict(),
         'actor': algo.actor.state_dict(),
         'critic': algo.critic.state_dict(),
         'iteration': total_iters,
     }
+    # 🎯 根据use_nav_style_features保存不同的特征提取器
+    if not use_nav_style_features:
+        final_checkpoint['backbone'] = algo.backbone.state_dict()
+    else:
+        final_checkpoint['lidar_cnn'] = algo.lidar_cnn.state_dict()
+        final_checkpoint['dyn_obs_mlp'] = algo.dyn_obs_mlp.state_dict()
     final_checkpoint_path = os.path.join(cfg['train']['checkpoint_dir'], 'policy_final.pt')
     torch.save(final_checkpoint, final_checkpoint_path)
     logger.log(f"最终模型已保存: {final_checkpoint_path}")

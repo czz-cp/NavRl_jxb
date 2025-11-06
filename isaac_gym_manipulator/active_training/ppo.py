@@ -570,7 +570,7 @@ class PPO:
         
         return action, logp
 
-    @torch.inference_mode()  # 比torch.no_grad()更高效，自动处理BatchNorm
+    @torch.no_grad()  # 比torch.no_grad()更高效，自动处理BatchNorm
     def act(self, voxel, aux, current_episode=None, total_episodes=None, obs_dict=None):
         """
         Actor输出动作（使用高斯分布，更适合机械臂控制）
@@ -861,11 +861,23 @@ class PPO:
                 self.critic_optim.zero_grad()
                 loss.backward()
                 # 梯度裁剪前检查梯度是否有效
-                for name, param in self.backbone.named_parameters():
-                    if param.grad is not None:
-                        if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                            print(f"[PPO] Warning: backbone.{name} gradient contains NaN/inf, zeroing...")
-                            param.grad.zero_()
+                if not self.use_nav_style_features:
+                    for name, param in self.backbone.named_parameters():
+                        if param.grad is not None:
+                            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                print(f"[PPO] Warning: backbone.{name} gradient contains NaN/inf, zeroing...")
+                                param.grad.zero_()
+                else:
+                    for name, param in self.lidar_cnn.named_parameters():
+                        if param.grad is not None:
+                            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                print(f"[PPO] Warning: lidar_cnn.{name} gradient contains NaN/inf, zeroing...")
+                                param.grad.zero_()
+                    for name, param in self.dyn_obs_mlp.named_parameters():
+                        if param.grad is not None:
+                            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                                print(f"[PPO] Warning: dyn_obs_mlp.{name} gradient contains NaN/inf, zeroing...")
+                                param.grad.zero_()
                 
                 for name, param in self.actor.named_parameters():
                     if param.grad is not None:
@@ -881,13 +893,18 @@ class PPO:
                 
                 # 梯度裁剪（参考isaac-training：max_norm=5.0）
                 max_grad_norm_isaac = 5.0  # isaac-training使用5.0，而不是配置中的1.0
-                grad_norm_backbone = nn.utils.clip_grad_norm_(self.backbone.parameters(), max_grad_norm_isaac)
+                if not self.use_nav_style_features:
+                    grad_norm_backbone = nn.utils.clip_grad_norm_(self.backbone.parameters(), max_grad_norm_isaac)
+                else:
+                    grad_norm_lidar = nn.utils.clip_grad_norm_(self.lidar_cnn.parameters(), max_grad_norm_isaac)
+                    grad_norm_dyn = nn.utils.clip_grad_norm_(self.dyn_obs_mlp.parameters(), max_grad_norm_isaac)
+                    grad_norm_backbone = max(grad_norm_lidar, grad_norm_dyn)  # 使用最大值作为特征范数
                 grad_norm_actor_batch = nn.utils.clip_grad_norm_(self.actor.parameters(), max_grad_norm_isaac)
                 grad_norm_critic_batch = nn.utils.clip_grad_norm_(self.critic.parameters(), max_grad_norm_isaac)
                 
                 # 检查梯度范数是否异常
                 if torch.isnan(grad_norm_backbone) or torch.isinf(grad_norm_backbone) or grad_norm_backbone > 1000:
-                    print(f"[PPO] Warning: backbone grad_norm={grad_norm_backbone}, skipping update")
+                    print(f"[PPO] Warning: feature grad_norm={grad_norm_backbone}, skipping update")
                     self.feature_optim.zero_grad()
                 else:
                     self.feature_optim.step()
@@ -906,13 +923,29 @@ class PPO:
                     self.critic_optim.step()
                 
                 # 更新后检查权重是否有效
-                for name, param in self.backbone.named_parameters():
-                    if torch.isnan(param).any() or torch.isinf(param).any():
-                        print(f"[PPO] Critical: backbone.{name} weight contains NaN/inf after update, reinitializing...")
-                        if 'weight' in name:
-                            nn.init.orthogonal_(param, gain=0.01)
-                        else:
-                            nn.init.constant_(param, 0.0)
+                if not self.use_nav_style_features:
+                    for name, param in self.backbone.named_parameters():
+                        if torch.isnan(param).any() or torch.isinf(param).any():
+                            print(f"[PPO] Critical: backbone.{name} weight contains NaN/inf after update, reinitializing...")
+                            if 'weight' in name:
+                                nn.init.orthogonal_(param, gain=0.01)
+                            else:
+                                nn.init.constant_(param, 0.0)
+                else:
+                    for name, param in self.lidar_cnn.named_parameters():
+                        if torch.isnan(param).any() or torch.isinf(param).any():
+                            print(f"[PPO] Critical: lidar_cnn.{name} weight contains NaN/inf after update, reinitializing...")
+                            if 'weight' in name:
+                                nn.init.orthogonal_(param, gain=0.01)
+                            else:
+                                nn.init.constant_(param, 0.0)
+                    for name, param in self.dyn_obs_mlp.named_parameters():
+                        if torch.isnan(param).any() or torch.isinf(param).any():
+                            print(f"[PPO] Critical: dyn_obs_mlp.{name} weight contains NaN/inf after update, reinitializing...")
+                            if 'weight' in name:
+                                nn.init.orthogonal_(param, gain=0.01)
+                            else:
+                                nn.init.constant_(param, 0.0)
                 
                 # 在step之前记录梯度范数（最后一个batch）
                 if s + self.batch_size >= B:  # 最后一个batch
