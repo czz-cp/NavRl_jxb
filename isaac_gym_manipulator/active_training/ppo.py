@@ -330,27 +330,49 @@ class PPO:
         self.action_limit = cfg.get('action_limit', 0.0189)  # 默认值改为0.0189（参考ur5e_DDPG）
         # 注意：已移除两步缩放，不再需要linear_vel_scale和angular_vel_scale
 
-        # Modules - 使用改进的网络架构
-        self.backbone = EfficientVoxelBackbone3D(voxel_channels).to(device)
-        
-        # 🎯 改进的特征融合：辅助信息处理
-        self.auxiliary_net = nn.Sequential(
-            nn.Linear(aux_dim, 64),
-            nn.ELU(inplace=True),
-            nn.Linear(64, 64),
-        ).to(device)
-        
-        # 🎯 特征融合层
-        # 视觉特征128维 + 辅助特征64维 = 192维
-        fusion_dim = self.backbone.out_dim + 64  # 128 + 64 = 192
-        self.fusion = nn.Sequential(
-            nn.Linear(self.backbone.out_dim + 64, 256),  # 192 → 256
-            nn.ELU(inplace=True),
-            nn.BatchNorm1d(256),
-        ).to(device)
-        
-        # 使用融合后的特征维度
-        fused_dim = 256
+        # Feature分支开关
+        self.use_nav_style_features = cfg.get('use_nav_style_features', False)
+
+        if not self.use_nav_style_features:
+            # ========== 原体素+aux 分支 ==========
+            self.backbone = EfficientVoxelBackbone3D(voxel_channels).to(device)
+            self.auxiliary_net = nn.Sequential(
+                nn.Linear(aux_dim, 64),
+                nn.ELU(inplace=True),
+                nn.Linear(64, 64),
+            ).to(device)
+            self.fusion = nn.Sequential(
+                nn.Linear(self.backbone.out_dim + 64, 256),
+                nn.ELU(inplace=True),
+                nn.BatchNorm1d(256),
+            ).to(device)
+            fused_dim = 256
+        else:
+            # ========== LiDAR + DynObs + State 分支（仿照 isaac-training，无注意力） ==========
+            # LiDAR CNN
+            self.lidar_cnn = nn.Sequential(
+                nn.Conv2d(1, 4, kernel_size=(5,3), padding=(2,1)), nn.ELU(),
+                nn.Conv2d(4, 16, kernel_size=(5,3), stride=(2,1), padding=(2,1)), nn.ELU(),
+                nn.Conv2d(16,16, kernel_size=(5,3), stride=(2,2), padding=(2,1)), nn.ELU(),
+                nn.Flatten(),
+                nn.LazyLinear(128), nn.LayerNorm(128)
+            ).to(device)
+            # 动态障碍 MLP（输入展平）
+            # 动态障碍物格式: [B, 1, num_closest, 8] -> 展平后 [B, num_closest * 8]
+            # 假设 num_closest=3，则输入维度为 3*8=24
+            num_closest_dyn_obs = cfg.get('num_closest_dyn_obs', 3)  # 从配置读取，默认3
+            dyn_obs_input_dim = num_closest_dyn_obs * 8  # 每个动态障碍物8维
+            self.dyn_obs_mlp = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(dyn_obs_input_dim, 128), nn.ELU(), nn.Linear(128, 64)
+            ).to(device)
+            # 融合：cnn(128) + state(aux_dim) + dyn(64)
+            self.fusion = nn.Sequential(
+                nn.Linear(128 + aux_dim + 64, 256),
+                nn.ELU(inplace=True),
+                nn.BatchNorm1d(256)
+            ).to(device)
+            fused_dim = 256
         
         # 🎯 改用高斯分布（更适合机械臂控制）
         self.actor = ActorHeadGaussian(fused_dim, action_dim).to(device)
@@ -364,12 +386,11 @@ class PPO:
         critic_lr = cfg.get('critic_lr', base_lr)
         
         # 🎯 将新添加的模块参数也加入优化器
-        self.feature_optim = optim.Adam(
-            list(self.backbone.parameters()) + 
-            list(self.auxiliary_net.parameters()) + 
-            list(self.fusion.parameters()), 
-            lr=feat_lr
-        )
+        if not self.use_nav_style_features:
+            feat_params = list(self.backbone.parameters()) + list(self.auxiliary_net.parameters()) + list(self.fusion.parameters())
+        else:
+            feat_params = list(self.lidar_cnn.parameters()) + list(self.dyn_obs_mlp.parameters()) + list(self.fusion.parameters())
+        self.feature_optim = optim.Adam(feat_params, lr=feat_lr)
         self.actor_optim = optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_optim = optim.Adam(self.critic.parameters(), lr=critic_lr)
 
@@ -404,45 +425,64 @@ class PPO:
         else:
             self.lr_scheduler = None
 
-    def _fuse(self, voxel, aux):
+    def _fuse(self, voxel=None, aux=None, obs_dict=None):
         """
-        🎯 改进的特征融合：使用独立的辅助网络 + 融合层
+        🎯 特征融合：
+        - 默认：voxel+aux
+        - nav-style：obs_dict={state, lidar, dyn_obs}
         
         Args:
-            voxel: [B, 1, 32, 32, 32] 体素数据
-            aux: [B, aux_dim] 辅助信息
+            voxel: [B, 1, 32, 32, 32]
+            aux: [B, aux_dim]
+            obs_dict: { 'state':[B,aux_dim], 'lidar':[B,1,W,H], 'dyn_obs':[B,1,K,10] }
         
         Returns:
             fused: [B, 256] 融合后的特征
         """
-        # 检查输入是否有 NaN 或 inf
-        if torch.isnan(voxel).any() or torch.isinf(voxel).any():
-            print(f"[PPO] Warning: voxel contains NaN/inf, replacing with zeros")
-            voxel = torch.where(torch.isnan(voxel) | torch.isinf(voxel), torch.zeros_like(voxel), voxel)
-        
-        # 检查 voxel 数值范围，防止过大值
-        if voxel.abs().max() > 100.0:
-            print(f"[PPO] Warning: voxel values too large (max={voxel.abs().max()}), clamping")
-            voxel = torch.clamp(voxel, -10.0, 10.0)
-        
-        if torch.isnan(aux).any() or torch.isinf(aux).any():
-            print(f"[PPO] Warning: aux contains NaN/inf, replacing with zeros")
-            aux = torch.where(torch.isnan(aux) | torch.isinf(aux), torch.zeros_like(aux), aux)
-        
-        # 限制 aux 数值范围
-        if aux.abs().max() > 100.0:
-            print(f"[PPO] Warning: aux values too large (max={aux.abs().max()}), clamping")
-            aux = torch.clamp(aux, -10.0, 10.0)
-        
-        # 🎯 3D视觉特征提取
-        voxel_feat = self.backbone(voxel)  # [B, 128]
-        
-        # 🎯 辅助信息处理
-        aux_feat = self.auxiliary_net(aux)  # [B, 64]
-        
-        # 🎯 特征融合
-        combined = torch.cat([voxel_feat, aux_feat], dim=1)  # [B, 192]
-        fused = self.fusion(combined)  # [B, 256]
+        if not self.use_nav_style_features:
+            if torch.isnan(voxel).any() or torch.isinf(voxel).any():
+                voxel = torch.where(torch.isnan(voxel) | torch.isinf(voxel), torch.zeros_like(voxel), voxel)
+            if voxel.abs().max() > 100.0:
+                voxel = torch.clamp(voxel, -10.0, 10.0)
+            if torch.isnan(aux).any() or torch.isinf(aux).any():
+                aux = torch.where(torch.isnan(aux) | torch.isinf(aux), torch.zeros_like(aux), aux)
+            if aux.abs().max() > 100.0:
+                aux = torch.clamp(aux, -10.0, 10.0)
+            voxel_feat = self.backbone(voxel)  # [B,128]
+            aux_feat = self.auxiliary_net(aux)  # [B,64]
+            fused = self.fusion(torch.cat([voxel_feat, aux_feat], dim=1))
+        else:
+            state = obs_dict['state']
+            lidar = obs_dict['lidar']
+            dyn_obs = obs_dict.get('dynamic_obstacle', obs_dict.get('dyn_obs', None))  # 支持两种键名
+            
+            # 🎯 修复：确保tensor可以用于反向传播（从推理模式转换）
+            # 使用 enable_grad() 上下文确保可以计算梯度
+            with torch.enable_grad():
+                # 创建新的tensor，确保不在推理模式
+                state = state.clone().detach().requires_grad_(False)
+                lidar = lidar.clone().detach().requires_grad_(False)
+                if dyn_obs is not None:
+                    dyn_obs = dyn_obs.clone().detach().requires_grad_(False)
+            
+            # 规范数值
+            for t in [state, lidar, dyn_obs]:
+                if t is not None:
+                    if torch.isnan(t).any() or torch.isinf(t).any():
+                        t = torch.where(torch.isnan(t) | torch.isinf(t), torch.zeros_like(t), t)
+            
+            # LiDAR CNN: 期望 [B,1,W,H]，其中W=h_beams, H=v_beams
+            lidar_feat = self.lidar_cnn(lidar)  # [B, 128]
+            
+            # 动态障碍物处理: [B, 1, num_closest, 8] -> 展平 -> MLP
+            if dyn_obs is not None:
+                dyn_feat = self.dyn_obs_mlp(dyn_obs)  # [B, 64]
+            else:
+                # 如果没有动态障碍物，使用零向量
+                dyn_feat = torch.zeros((state.shape[0], 64), device=state.device)
+            
+            # 融合: cnn(128) + state(state_dim) + dyn(64)
+            fused = self.fusion(torch.cat([lidar_feat, state, dyn_feat], dim=1))  # [B, 256]
         
         # 检查融合后的特征
         if torch.isnan(fused).any() or torch.isinf(fused).any():
@@ -531,7 +571,7 @@ class PPO:
         return action, logp
 
     @torch.inference_mode()  # 比torch.no_grad()更高效，自动处理BatchNorm
-    def act(self, voxel, aux, current_episode=None, total_episodes=None):
+    def act(self, voxel, aux, current_episode=None, total_episodes=None, obs_dict=None):
         """
         Actor输出动作（使用高斯分布，更适合机械臂控制）
         
@@ -550,7 +590,7 @@ class PPO:
         # inference_mode() 已经自动处理了BatchNorm的行为
         # 移除所有 .eval() 和 .train() 调用，提升性能
         
-        fused = self._fuse(voxel, aux) # 自动使用eval模式
+        fused = self._fuse(voxel, aux, obs_dict)
         mean, log_std = self.actor(fused)
         
         # 检查输出是否有 NaN/inf
@@ -594,7 +634,7 @@ class PPO:
         
         return action, logp, v
 
-    def evaluate(self, voxel, aux, a):
+    def evaluate(self, voxel, aux, a, obs_dict=None):
         """
         评估动作（使用高斯分布）
         
@@ -607,44 +647,46 @@ class PPO:
             v: [batch] 价值函数估计
         """
         # 🎯 评估时保持训练模式（用于计算梯度）
-        fused = self._fuse(voxel, aux)
-        mean, log_std = self.actor(fused)
-        
-        # 检查输出是否有 NaN/inf
-        if torch.isnan(mean).any() or torch.isinf(mean).any():
-            mean = torch.where(torch.isnan(mean) | torch.isinf(mean), torch.zeros_like(mean), mean)
-        if torch.isnan(log_std).any() or torch.isinf(log_std).any():
-            log_std = torch.where(torch.isnan(log_std) | torch.isinf(log_std), 
-                                 torch.zeros_like(log_std) - 0.5, log_std)
-        
-        # 计算标准差
-        std = torch.exp(log_std.clamp(-1.0, 1.0))  # 限制std范围 [0.368, 2.718] - 增大标准差范围以允许更大的探索
-        
-        # 🎯 将动作转换回无界空间（逆tanh变换）
-        # 在act中：action = tanh(action_raw) * action_limit
-        # 所以：action_tanh = action / action_limit = tanh(action_raw)
-        # 反向：action_raw = atanh(action_tanh)
-        action_normalized = a / self.action_limit  # [batch, 6] ∈ [-1, 1]，即 tanh(action_raw)
-        
-        # 计算 atanh（tanh的逆函数）
-        # atanh(x) = 0.5 * ln((1+x)/(1-x))，需要限制x在[-1+eps, 1-eps]范围内
-        action_normalized_clamped = torch.clamp(action_normalized, -0.999, 0.999)  # 避免atanh的数值问题
-        action_raw = 0.5 * torch.log((1.0 + action_normalized_clamped) / (1.0 - action_normalized_clamped + 1e-8))
-        
-        # 创建高斯分布
-        dist = torch.distributions.Normal(mean, std)
-        
-        # 🎯 计算log_prob（需要考虑tanh变换的雅可比行列式）
-        logp_raw = dist.log_prob(action_raw).sum(-1)  # 高斯分布的log_prob
-        # tanh的雅可比行列式修正项：log|d tanh(x)/dx| = log(1 - tanh^2(x))
-        tanh_correction = torch.log(1.0 - action_normalized_clamped.pow(2) + 1e-6).sum(-1)  # 避免log(0)
-        logp = logp_raw - tanh_correction  # 修正后的log_prob
-        
-        # 计算熵
-        ent = dist.entropy().sum(-1)
-        
-        # 价值函数估计
-        v = self.critic(fused)
+        # 确保不在推理模式中，以便可以计算梯度
+        with torch.enable_grad():
+            fused = self._fuse(voxel, aux, obs_dict)
+            mean, log_std = self.actor(fused)
+            
+            # 检查输出是否有 NaN/inf
+            if torch.isnan(mean).any() or torch.isinf(mean).any():
+                mean = torch.where(torch.isnan(mean) | torch.isinf(mean), torch.zeros_like(mean), mean)
+            if torch.isnan(log_std).any() or torch.isinf(log_std).any():
+                log_std = torch.where(torch.isnan(log_std) | torch.isinf(log_std), 
+                                     torch.zeros_like(log_std) - 0.5, log_std)
+            
+            # 计算标准差
+            std = torch.exp(log_std.clamp(-1.0, 1.0))  # 限制std范围 [0.368, 2.718] - 增大标准差范围以允许更大的探索
+            
+            # 🎯 将动作转换回无界空间（逆tanh变换）
+            # 在act中：action = tanh(action_raw) * action_limit
+            # 所以：action_tanh = action / action_limit = tanh(action_raw)
+            # 反向：action_raw = atanh(action_tanh)
+            action_normalized = a / self.action_limit  # [batch, 6] ∈ [-1, 1]，即 tanh(action_raw)
+            
+            # 计算 atanh（tanh的逆函数）
+            # atanh(x) = 0.5 * ln((1+x)/(1-x))，需要限制x在[-1+eps, 1-eps]范围内
+            action_normalized_clamped = torch.clamp(action_normalized, -0.999, 0.999)  # 避免atanh的数值问题
+            action_raw = 0.5 * torch.log((1.0 + action_normalized_clamped) / (1.0 - action_normalized_clamped + 1e-8))
+            
+            # 创建高斯分布
+            dist = torch.distributions.Normal(mean, std)
+            
+            # 🎯 计算log_prob（需要考虑tanh变换的雅可比行列式）
+            logp_raw = dist.log_prob(action_raw).sum(-1)  # 高斯分布的log_prob
+            # tanh的雅可比行列式修正项：log|d tanh(x)/dx| = log(1 - tanh^2(x))
+            tanh_correction = torch.log(1.0 - action_normalized_clamped.pow(2) + 1e-6).sum(-1)  # 避免log(0)
+            logp = logp_raw - tanh_correction  # 修正后的log_prob
+            
+            # 计算熵
+            ent = dist.entropy().sum(-1)
+            
+            # 价值函数估计
+            v = self.critic(fused)
         
         return logp, ent, v
 
@@ -675,7 +717,7 @@ class PPO:
             if clip_fraction_adv > 0.1:  # 如果超过10%被裁剪，打印警告
                 print(f"[PPO] Warning: {clip_fraction_adv*100:.1f}% advantage clipped (adv_clip={self.adv_clip}, adv_mean={adv_mean.item():.2f}, adv_std={adv_std.item():.2f})")
         
-        B = traj['voxel'].shape[0]
+        B = traj['voxel'].shape[0] if 'voxel' in traj else traj['obs_dict']['state'].shape[0]
         idx = torch.randperm(B, device=self.device)
 
         # ValueNorm on returns（参考isaac-training实现）
@@ -715,10 +757,30 @@ class PPO:
                             print(f"[PPO] Warning: traj['{key}'] contains NaN/inf in epoch {epoch}, replacing with zeros")
                             traj[key] = torch.where(torch.isnan(traj[key]) | torch.isinf(traj[key]), 
                                                    torch.zeros_like(traj[key]), traj[key])
+                # 🎯 检查obs_dict（如果存在）
+                if 'obs_dict' in traj:
+                    for key in ['state', 'lidar', 'dynamic_obstacle']:
+                        if key in traj['obs_dict']:
+                            if torch.isnan(traj['obs_dict'][key]).any() or torch.isinf(traj['obs_dict'][key]).any():
+                                print(f"[PPO] Warning: traj['obs_dict']['{key}'] contains NaN/inf in epoch {epoch}, replacing with zeros")
+                                traj['obs_dict'][key] = torch.where(torch.isnan(traj['obs_dict'][key]) | torch.isinf(traj['obs_dict'][key]), 
+                                                                   torch.zeros_like(traj['obs_dict'][key]), traj['obs_dict'][key])
             
             for s in range(0, B, self.batch_size):
                 b = idx[s:s + self.batch_size]
-                logp, ent, v = self.evaluate(traj['voxel'][b], traj['aux'][b], traj['act'][b])
+                # 🎯 支持字典格式观测
+                if 'obs_dict' in traj:
+                    # 🎯 修复：确保batch tensor可以用于反向传播
+                    # 使用 enable_grad() 上下文确保可以计算梯度
+                    with torch.enable_grad():
+                        obs_dict_batch = {
+                            'state': traj['obs_dict']['state'][b].clone().detach().requires_grad_(False),
+                            'lidar': traj['obs_dict']['lidar'][b].clone().detach().requires_grad_(False),
+                            'dynamic_obstacle': traj['obs_dict']['dynamic_obstacle'][b].clone().detach().requires_grad_(False),
+                        }
+                    logp, ent, v = self.evaluate(None, None, traj['act'][b], obs_dict=obs_dict_batch)
+                else:
+                    logp, ent, v = self.evaluate(traj['voxel'][b], traj['aux'][b], traj['act'][b])
                 
                 # 检查 evaluate 输出是否有效
                 if torch.isnan(logp).any() or torch.isinf(logp).any():
@@ -863,7 +925,11 @@ class PPO:
             
             # KL早停检查（在每个epoch后）
             with torch.no_grad():
-                logp_new, _, _ = self.evaluate(traj['voxel'], traj['aux'], traj['act'])
+                # 🎯 支持字典格式观测
+                if 'obs_dict' in traj:
+                    logp_new, _, _ = self.evaluate(None, None, traj['act'], obs_dict=traj['obs_dict'])
+                else:
+                    logp_new, _, _ = self.evaluate(traj['voxel'], traj['aux'], traj['act'])
                 ratio_all = (logp_new - traj['logp']).exp()
                 approx_kl = ((ratio_all - 1) - (logp_new - traj['logp'])).mean()
                 
@@ -877,7 +943,11 @@ class PPO:
 
         # 计算最终监控指标
         with torch.no_grad():
-            logp_new, ent_new, _ = self.evaluate(traj['voxel'], traj['aux'], traj['act'])
+            # 🎯 支持字典格式观测
+            if 'obs_dict' in traj:
+                logp_new, ent_new, _ = self.evaluate(None, None, traj['act'], obs_dict=traj['obs_dict'])
+            else:
+                logp_new, ent_new, _ = self.evaluate(traj['voxel'], traj['aux'], traj['act'])
             ratio_all = (logp_new - traj['logp']).exp()
             approx_kl = ((ratio_all - 1) - (logp_new - traj['logp'])).mean()
             clip_fraction = ((ratio_all - 1.0).abs() > self.clip_eps).float().mean()

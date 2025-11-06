@@ -307,12 +307,24 @@ def main():
 
     Vx, Vy, Vz = cfg['voxel']['size']
     voxel_shape = (cfg['voxel']['channels'], Vx, Vy, Vz)
-    aux_dim = 18  # 18维观测空间（基于论文重新设计：目标状态4维+机械臂状态9维+感知信息5维）
+    
+    # 🎯 根据是否使用nav_style_features决定观测维度
+    use_nav_style_features = cfg['ppo'].get('use_nav_style_features', False)
+    if use_nav_style_features:
+        # LiDAR + Dynamic Obstacle + State 格式
+        # state维度保持18维（包含ArUco检测状态）
+        state_dim = 18  # 18维观测空间：目标状态(4) + 机械臂状态(9) + 感知信息(5)
+        aux_dim = state_dim  # 为了向后兼容，保留aux_dim名称
+    else:
+        # 旧的体素+aux格式
+        aux_dim = 18  # 18维观测空间（基于论文重新设计：目标状态4维+机械臂状态9维+感知信息5维）
+    
     action_dim = cfg['env']['action_dim']  # 从env配置读取，应该是6
 
     # 将动作缩放参数传递给PPO（从env配置读取）
     ppo_cfg = cfg['ppo'].copy()
     ppo_cfg['action_limit'] = env_cfg.get('action_limit', 0.0189)  # 默认值改为0.0189（参考ur5e_DDPG）
+    ppo_cfg['num_closest_dyn_obs'] = env_cfg.get('num_closest_dyn_obs', 3)  # 传递给PPO用于动态障碍物MLP初始化
     # 注意：已移除两步缩放，不再需要linear_vel_scale和angular_vel_scale
     
     algo = PPO(ppo_cfg, (voxel_shape, aux_dim), action_dim, env.device)
@@ -324,6 +336,17 @@ def main():
 
     prev_angle_deg = None#上一个关节角度
     env.reset()
+    
+    # 🎯 修复：在reset后立即显示viewer窗口（如果启用）
+    if env.enable_viewer and env.viewer is not None:
+        try:
+            print("[Visualization] 正在显示viewer窗口...")
+            env.gym.poll_viewer_events(env.viewer)
+            env.gym.step_graphics(env.sim)
+            env.gym.draw_viewer(env.viewer, env.sim, True)  # 第一次使用阻塞模式确保窗口显示
+            print("[Visualization] ✅ Viewer窗口已显示")
+        except Exception as e:
+            print(f"[Warning] 无法显示viewer窗口: {e}")
     
     # 🎯 关键修复：reset()后GPU同步，确保动态障碍物更新完成
     if torch.cuda.is_available():
@@ -354,8 +377,11 @@ def main():
 
     # 预分配rollout tensors（内存优化）
     num_envs = env.num_envs
-    aux_dim_val = aux_dim  # 18维观测空间（基于论文重新设计）
+    aux_dim_val = aux_dim  # 观测维度（根据use_nav_style_features决定）
     action_dim_val = action_dim if isinstance(action_dim, int) else cfg['env']['action_dim']
+    
+    # 🎯 如果使用nav_style_features，需要预分配字典格式的观测
+    use_nav_style_features = cfg['ppo'].get('use_nav_style_features', False)
     
     print(f"\n{'='*80}")
     print(f"[Training] Starting training: {total_iters} iterations, {rollout} rollout steps")
@@ -400,6 +426,9 @@ def main():
         # 🎯 动作概率（用于自适应折扣因子）
         action_probs = torch.zeros((rollout, num_envs), device=env.device) if use_adaptive_gamma else None
         
+        # 🎯 如果使用nav_style_features，初始化obs_dicts列表
+        obs_dicts = [] if use_nav_style_features else None
+        
         # 🎯 关键修复：验证张量形状匹配，防止内存访问越界
         try:
             assert voxels.shape == (rollout, num_envs, *voxel_shape), \
@@ -436,17 +465,23 @@ def main():
                 print(f"[Rollout] Step {t+1}/{rollout} (iter {it}/{total_iters})")
                 logger.log(f"[Rollout] Step {t+1}/{rollout} (iter {it}/{total_iters})")
             
-            # 🎯 关键修复：当启用viewer时，完全跳过相机和体素相关操作，避免段错误
-            # 只保留基本的仿真和可视化功能
-            if env.enable_viewer:
-                # 当启用viewer时，跳过所有相机和体素操作，使用空体素地图
-                # 创建空的体素地图
+            # 🎯 关键修复：当使用LiDAR时，跳过所有相机和体素操作
+            # 当启用viewer或使用nav_style_features时，跳过相机和体素操作
+            if env.enable_viewer or use_nav_style_features:
+                # 当启用viewer或使用LiDAR时，跳过所有相机和体素操作，使用空体素地图
+                # 创建空的体素地图（用于向后兼容，但PPO不会使用）
                 Nx, Ny, Nz = map(int, grid_size.tolist())
                 voxel = torch.zeros((1, 1, Nx, Ny, Nz), device=env.device)
-                # 辅助观测序列（使用空体素地图）
-                aux = env.observe(voxel=voxel, grid_origin=grid_origin, voxel_res=voxel_res)
+                # 获取观测（字典格式或旧格式）
+                obs = env.observe(voxel=voxel, grid_origin=grid_origin, voxel_res=voxel_res)
+                if use_nav_style_features and isinstance(obs, dict):
+                    # 字典格式：提取state（18维，包含ArUco检测状态）
+                    aux = obs['state']  # [num_envs, 18]
+                else:
+                    # 旧格式：直接使用
+                    aux = obs
             else:
-                # 不启用viewer时，正常执行所有操作
+                # 不启用viewer且不使用LiDAR时，正常执行所有操作（使用体素地图）
                 depth = env.render_depth()#渲染深度图
                 cam_T_w = env.camera_pose()
                 intr = env.intrinsics#相机内参矩阵
@@ -518,8 +553,14 @@ def main():
                             device=env.device,
                         ) 
                 logger.log(f"体素处理前: {voxel.shape}")
-                # 辅助观测序列（传入体素地图用于障碍物距离计算）
-                aux = env.observe(voxel=voxel, grid_origin=grid_origin, voxel_res=voxel_res) 
+                # 获取观测（字典格式或旧格式）
+                obs = env.observe(voxel=voxel, grid_origin=grid_origin, voxel_res=voxel_res)
+                if use_nav_style_features and isinstance(obs, dict):
+                    # 字典格式：提取state（18维，包含ArUco检测状态）
+                    aux = obs['state']  # [num_envs, 18]
+                else:
+                    # 旧格式：直接使用
+                    aux = obs
                 
                 logger.log(f"辅助观测处理前: {aux.shape}")
             
@@ -557,8 +598,16 @@ def main():
             if not env.enable_viewer:  # 仅在非viewer模式下记录日志，避免段错误
                 logger.log(f"辅助观测处理后: {aux.shape}")
             
+            # 🎯 准备观测字典（如果使用nav_style_features）
+            if use_nav_style_features and isinstance(obs, dict):
+                obs_dict = obs  # 直接使用字典格式
+                voxel_for_ppo = None  # 不使用体素
+            else:
+                obs_dict = None  # 不使用字典格式
+                voxel_for_ppo = voxel  # 使用体素
+            
             # 🎯 动作集成策略：传递当前迭代信息
-            a, logp, v = algo.act(voxel, aux, current_episode=it, total_episodes=total_iters) # 网络推理得到动作（批量处理）
+            a, logp, v = algo.act(voxel_for_ppo, aux, current_episode=it, total_episodes=total_iters, obs_dict=obs_dict) # 网络推理得到动作（批量处理）
             
             # 🎯 调试：检查动作和值（仅在非viewer模式下，避免段错误）
             if not env.enable_viewer and t == 0 and it == 1:
@@ -740,8 +789,17 @@ def main():
                     traceback.print_exc()
 
             # 🎯 批量存储数据（优化：直接批量赋值，无需循环）
-            voxels[t] = voxel  # [num_envs, C, Vx, Vy, Vz] -> 直接赋值
-            auxes[t] = aux     # [num_envs, aux_dim]
+            if use_nav_style_features:
+                # 字典格式：存储完整的obs_dict
+                if isinstance(obs, dict):
+                    obs_dicts.append(obs)  # 存储字典格式观测
+                # 仍然存储voxel和aux用于向后兼容（但PPO不会使用）
+                voxels[t] = voxel  # [num_envs, C, Vx, Vy, Vz]
+                auxes[t] = aux     # [num_envs, aux_dim]
+            else:
+                # 旧格式：直接存储voxel和aux
+                voxels[t] = voxel  # [num_envs, C, Vx, Vy, Vz] -> 直接赋值
+                auxes[t] = aux     # [num_envs, aux_dim]
             
             # 确保动作形状正确
             if a.dim() == 1:
@@ -927,43 +985,63 @@ def main():
 
         # 🎯 计算最后一个状态的体素和价值（用于GAE）
         with torch.no_grad():
-            depth = env.render_depth()
-            cam_T_w = env.camera_pose()
-            intr = env.intrinsics
-            
-            # 计算最后一个状态的体素
-            if use_incremental_voxel and global_voxel is not None:
-                global_voxel = update_voxel_from_depth(
-                    global_voxel=global_voxel,
-                    depth=depth,
-                    cam_T_w=cam_T_w,
-                    intrinsics=intr,
-                    grid_origin=grid_origin,
-                    grid_size=grid_size,
-                    voxel_res=voxel_res,
-                    max_range=env.max_range,
-                    subsample=4,
-                    decay_factor=cfg.get('voxel', {}).get('decay_factor', 0.95),
-                    device=env.device,
-                )
-                voxel = global_voxel.clone()
+            # 🎯 当使用LiDAR时，跳过相机和体素操作
+            if env.enable_viewer or use_nav_style_features:
+                # 使用空体素地图（用于向后兼容，但PPO不会使用）
+                Nx, Ny, Nz = map(int, grid_size.tolist())
+                voxel = torch.zeros((1, 1, Nx, Ny, Nz), device=env.device)
+                last_voxel = prepare_voxel_for_training(voxel, num_envs, voxel_shape)
             else:
-                voxel = build_voxel_from_depth(
-                    depth=depth,
-                    cam_T_w=cam_T_w,
-                    intrinsics=intr,
-                    grid_origin=grid_origin,
-                    grid_size=grid_size,
-                    voxel_res=voxel_res,
-                    max_range=env.max_range,
-                    subsample=4,
-                    device=env.device,
-                )
-            # 🎯 多环境支持：将 voxel 扩展到所有环境
-            last_voxel = prepare_voxel_for_training(voxel, num_envs, voxel_shape)
+                # 不启用viewer且不使用LiDAR时，正常执行所有操作（使用体素地图）
+                depth = env.render_depth()
+                cam_T_w = env.camera_pose()
+                intr = env.intrinsics
+                
+                # 计算最后一个状态的体素
+                if use_incremental_voxel and global_voxel is not None:
+                    global_voxel = update_voxel_from_depth(
+                        global_voxel=global_voxel,
+                        depth=depth,
+                        cam_T_w=cam_T_w,
+                        intrinsics=intr,
+                        grid_origin=grid_origin,
+                        grid_size=grid_size,
+                        voxel_res=voxel_res,
+                        max_range=env.max_range,
+                        subsample=4,
+                        decay_factor=cfg.get('voxel', {}).get('decay_factor', 0.95),
+                        device=env.device,
+                    )
+                    voxel = global_voxel.clone()
+                else:
+                    voxel = build_voxel_from_depth(
+                        depth=depth,
+                        cam_T_w=cam_T_w,
+                        intrinsics=intr,
+                        grid_origin=grid_origin,
+                        grid_size=grid_size,
+                        voxel_res=voxel_res,
+                        max_range=env.max_range,
+                        subsample=4,
+                        device=env.device,
+                    )
+                # 🎯 多环境支持：将 voxel 扩展到所有环境
+                last_voxel = prepare_voxel_for_training(voxel, num_envs, voxel_shape)
             
-            last_aux = env.observe(voxel=last_voxel, grid_origin=grid_origin, voxel_res=voxel_res)  # [num_envs, aux_dim]
-            _, _, last_values = algo.act(last_voxel, last_aux, current_episode=it, total_episodes=total_iters)  # last_values: [num_envs]
+            # 获取最后一步的观测
+            last_obs = env.observe(voxel=last_voxel, grid_origin=grid_origin, voxel_res=voxel_res)
+            if use_nav_style_features and isinstance(last_obs, dict):
+                # 字典格式：提取state（18维，包含ArUco检测状态）
+                last_aux = last_obs['state']  # [num_envs, 18]
+                last_obs_dict = last_obs
+                last_voxel_for_ppo = None
+            else:
+                # 旧格式：直接使用
+                last_aux = last_obs
+                last_obs_dict = None
+                last_voxel_for_ppo = last_voxel
+            
+            _, _, last_values = algo.act(last_voxel_for_ppo, last_aux, current_episode=it, total_episodes=total_iters, obs_dict=last_obs_dict)  # last_values: [num_envs]
             
             # 🎯 确保 last_values 形状正确
             if last_values.dim() == 0:
@@ -1005,6 +1083,17 @@ def main():
             'ret': ret.flatten(),                    # [T*N]
             'val_den': vals_den.flatten(),           # [T*N]
         }
+        
+        # 🎯 如果使用nav_style_features，添加obs_dict到traj
+        if use_nav_style_features and obs_dicts is not None and len(obs_dicts) > 0:
+            # 将obs_dicts列表转换为字典格式的tensor
+            # obs_dicts是长度为T的列表，每个元素是字典 {state, lidar, dynamic_obstacle}
+            # 🎯 修复：确保tensor可以用于反向传播（从推理模式转换）
+            traj['obs_dict'] = {
+                'state': torch.stack([obs['state'] for obs in obs_dicts], dim=0).view(-1, aux_dim_val).clone().detach().requires_grad_(False),  # [T*N, state_dim]
+                'lidar': torch.stack([obs['lidar'] for obs in obs_dicts], dim=0).view(-1, *obs_dicts[0]['lidar'].shape[1:]).clone().detach().requires_grad_(False),  # [T*N, 1, h_beams, v_beams]
+                'dynamic_obstacle': torch.stack([obs['dynamic_obstacle'] for obs in obs_dicts], dim=0).view(-1, *obs_dicts[0]['dynamic_obstacle'].shape[1:]).clone().detach().requires_grad_(False),  # [T*N, 1, num_closest, 8]
+            }
         # 训练更新
         print(f"[Training] Updating policy (iter {it}/{total_iters})...")
         logger.log(f"[Training] 开始更新策略 (iter {it}/{total_iters})")

@@ -10,7 +10,7 @@ voxel:
 # env (Isaac Gym UR10e)
 env:
   num_envs: 2  # 支持多环境并行训练（建议4-16）
-  max_steps: 1200
+  max_steps: 1500
   img_w: 640
   img_h: 480
   fov_deg: 87.0
@@ -22,11 +22,22 @@ env:
                                     # 例如: gpu_device_id: 1 表示使用GPU 1
   
   # Visualization settings
-  enable_viewer: false             # 启用 Isaac Gym 可视化窗口
+  enable_viewer: true             # 启用 Isaac Gym 可视化窗口
   camera_pos: [1.5, -1.5, 1.2]    # 视口相机位置 [x, y, z] - 从侧面/上方观看机械臂
   camera_target: [0.0, 0.0, 0.6]  # 视口相机目标 [x, y, z] - 看向机械臂中心略上方
   render_freq: 1                  # 渲染频率（每N步渲染一次，10=每10步渲染一次，降低频率以提高性能）
   visualize_env_index: 0           # 只可视化第一个环境（env 0）
+  
+  # LiDAR (替代体素输入；安装在末端执行器坐标系)
+  use_lidar_input: true            # 使用LiDAR+动态障碍作为感知输入
+  lidar_range: 3.0                 # LiDAR最大量程（米）
+  lidar_vfov: [-10.0, 10.0]        # 垂直视场角（度）
+  lidar_vbeams: 4                  # 垂直光束数
+  lidar_hres: 10.0                 # 水平分辨率（度）；水平光束数=360/分辨率
+  
+  # 相机（用于 ArUco 检测，必须保留）
+  aruco_camera_enabled: true       # 强制创建 wrist 相机用于图像采集
+  aruco_render_freq: 5             # 取图频率（每N步渲染一次相机），降低争用
   
   action_dim: 6                    # 关节角度增量维度 [dq1, dq2, dq3, dq4, dq5, dq6]（弧度）
   action_limit: 0.1                # 关节角度增量限制（弧度/步）- 增大以鼓励更大的动作幅度
@@ -114,7 +125,7 @@ reward:
 
 # ppo
 ppo:
-  rollout_steps: 128         # 从32增加到64，提高episode完成率（参考：isaac-training用16但有256并行环境）
+  rollout_steps: 256         # 从32增加到64，提高episode完成率（参考：isaac-training用16但有256并行环境）
   gamma: 0.99
   gae_lambda: 0.95
   clip_eps: 0.2
@@ -138,6 +149,9 @@ ppo:
   feature_lr: 0.0001       # Feature extractor学习率
   actor_lr: 0.0001          # Actor学习率
   critic_lr: 0.0001         # Critic学习率（降低以稳定训练）
+  
+  # Feature提取分支选择
+  use_nav_style_features: true   # 使用“LiDAR + DynObs + State”的融合分支（不使用体素/注意力）
   
   # 动作集成策略（泊松分布采样）
   use_action_ensemble: true  # 是否启用动作集成策略（默认关闭）

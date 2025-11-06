@@ -10,6 +10,21 @@ from isaacgym import gymtorch
 
 import torch
 
+# 导入数学工具函数（用于LiDAR射线旋转）
+try:
+    from ..utils.math_utils import quat_rotate_vector_batch
+except ImportError:
+    try:
+        from isaac_gym_manipulator.utils.math_utils import quat_rotate_vector_batch
+    except ImportError:
+        # 如果导入失败，定义本地版本
+        def quat_rotate_vector_batch(quat, vec):
+            quat_w = quat[:, 3:4]
+            quat_xyz = quat[:, :3]
+            uv = torch.cross(quat_xyz, vec, dim=1)
+            uuv = torch.cross(quat_xyz, uv, dim=1)
+            return vec + 2.0 * (quat_w * uv + uuv)
+
 
 class ArmNavEnv:
     """
@@ -557,7 +572,30 @@ class ArmNavEnv:
         self.obstacle_actual_radii = []  # 存储实际创建的障碍物半径
         self.obstacle_positions_np = []  # 存储障碍物位置（numpy格式，用于跟踪）
         
-        # 体素地图相关（用于从体素地图推断障碍物距离）
+        # LiDAR参数（从配置读取，参考无人机环境）
+        if cfg is not None and 'env' in cfg:
+            env_cfg = cfg['env']
+            self.use_lidar_input = env_cfg.get('use_lidar_input', True)  # 默认启用LiDAR
+            self.lidar_range = env_cfg.get('lidar_range', 3.0)  # LiDAR最大量程（米）
+            self.lidar_vfov = env_cfg.get('lidar_vfov', [-10.0, 10.0])  # 垂直视场角（度）
+            self.lidar_vbeams = env_cfg.get('lidar_vbeams', 4)  # 垂直光束数
+            self.lidar_hres = env_cfg.get('lidar_hres', 10.0)  # 水平分辨率（度）
+        else:
+            self.use_lidar_input = True
+            self.lidar_range = 3.0
+            self.lidar_vfov = [-10.0, 10.0]
+            self.lidar_vbeams = 4
+            self.lidar_hres = 10.0
+        
+        # 计算水平光束数
+        self.lidar_hbeams = int(360 / self.lidar_hres)  # 例如：360/10=36
+        self.lidar_resolution = (self.lidar_hbeams, self.lidar_vbeams)  # (h_beams, v_beams)
+        
+        # LiDAR射线方向（将在首次调用时初始化）
+        self.ray_directions = None  # [h_beams, v_beams, 3] 局部坐标系中的射线方向
+        self.lidar_scan = None  # [num_envs, 1, h_beams, v_beams] LiDAR扫描数据
+        
+        # 体素地图相关（已废弃，保留用于向后兼容）
         self.voxel_grid_origin = None  # 体素网格原点
         self.voxel_res = None  # 体素分辨率
         self.current_voxel = None  # 当前体素地图（用于障碍物距离计算）
@@ -696,8 +734,13 @@ class ArmNavEnv:
                     self.enable_viewer = False
                     return
                 
-                # 🎯 参考代码使用 True（阻塞模式）
-                self.gym.draw_viewer(self.viewer, self.sim, True)
+                # 🎯 修复：使用 False（非阻塞模式），避免阻塞训练循环
+                # 第一次渲染时使用 True 确保窗口显示
+                blocking = (self.render_step_count == render_freq)  # 第一次渲染时阻塞
+                self.gym.draw_viewer(self.viewer, self.sim, blocking)
+                
+                # 处理viewer事件（必须在draw_viewer之后调用）
+                self.gym.poll_viewer_events(self.viewer)
                     
             except Exception as e:
                 # 如果draw_viewer失败，禁用可视化但继续训练
@@ -1310,6 +1353,15 @@ class ArmNavEnv:
         # 更新viewer相机视角（如果启用可视化）
         self._update_viewer_camera()
         
+        # 🎯 修复：在reset后立即显示viewer窗口（如果启用）
+        if self.enable_viewer and self.viewer is not None:
+            try:
+                self.gym.poll_viewer_events(self.viewer)
+                self.gym.step_graphics(self.sim)
+                self.gym.draw_viewer(self.viewer, self.sim, False)  # 非阻塞模式，避免阻塞训练
+            except Exception as e:
+                print(f"[Warning] Failed to render viewer in reset(): {e}")
+        
         # 🎯 标记图形状态已初始化（reset()中已经执行了仿真和step_graphics()）
         # 这样render_depth()就知道图形状态已经准备好
         self._graphics_initialized = True
@@ -1648,27 +1700,169 @@ class ArmNavEnv:
         result = max(0.0, min_dist - voxel_radius)
         return result if torch.isfinite(torch.tensor(result)) else 10.0
 
+    def _compute_ray_directions(self):
+        """预计算 LiDAR 射线方向（在末端执行器坐标系中）"""
+        # 水平角度: 0 到 360 度
+        h_angles = torch.linspace(0, 360 - self.lidar_hres, self.lidar_hbeams, device=self.device)
+        h_angles_rad = torch.deg2rad(h_angles)
+        
+        # 垂直角度: vfov[0] 到 vfov[1]（度转弧度）
+        v_angles_deg = torch.linspace(self.lidar_vfov[0], self.lidar_vfov[1], self.lidar_vbeams, device=self.device)
+        v_angles_rad = torch.deg2rad(v_angles_deg)
+        
+        # 创建网格
+        h_grid, v_grid = torch.meshgrid(h_angles_rad, v_angles_rad, indexing='ij')
+        
+        # 计算射线方向（球坐标转笛卡尔坐标）
+        # X: 前方, Y: 左方, Z: 上方（末端执行器坐标系）
+        x = torch.cos(v_grid) * torch.cos(h_grid)
+        y = torch.cos(v_grid) * torch.sin(h_grid)
+        z = torch.sin(v_grid)
+        
+        # [h_beams, v_beams, 3]
+        self.ray_directions = torch.stack([x, y, z], dim=-1)
+        
+        print(f"[LiDAR] 射线方向已预计算: {self.ray_directions.shape}, h_beams={self.lidar_hbeams}, v_beams={self.lidar_vbeams}")
+    
+    def _update_lidar(self):
+        """更新 LiDAR 扫描数据 - GPU 优化版本（参考manipulator_env_gym.py）"""
+        # 第一次调用时初始化射线方向
+        if self.ray_directions is None:
+            self._compute_ray_directions()
+        
+        # 获取末端执行器状态
+        ee_pos = self.ee_pos  # [num_envs, 3]
+        ee_quat = self.ee_quat  # [num_envs, 4]
+        
+        # 🎯 更新障碍物位置（从root_states读取）- 只检测静态障碍物（参考isaac-training）
+        # LiDAR只检测静态mesh，动态障碍物通过dyn_obs_state单独获取
+        actors_per_env = 2 + self.num_obstacles + self.num_dynamic_obstacles
+        obstacle_start_idx = 2  # robot(0) + target(1)
+        
+        if self.num_obstacles == 0:
+            # 没有静态障碍物，返回最大距离
+            self.lidar_scan = torch.full((self.num_envs, 1, self.lidar_hbeams, self.lidar_vbeams), self.lidar_range, device=self.device)
+            return
+        
+        # 生成所有静态障碍物索引（向量化）
+        # 🎯 修复：确保索引与root_states在同一设备上（root_states通常在CPU）
+        root_states_device = self.root_states.device
+        env_ids = torch.arange(self.num_envs, device=root_states_device).unsqueeze(1).expand(-1, self.num_obstacles).flatten()
+        obs_ids = torch.arange(self.num_obstacles, device=root_states_device).unsqueeze(0).expand(self.num_envs, -1).flatten()
+        obstacle_indices = env_ids * actors_per_env + obstacle_start_idx + obs_ids
+        
+        # 批量提取静态障碍物位置和半径
+        all_obs_pos = self.root_states[obstacle_indices.long(), 0:3].to(self.device)
+        obstacle_positions = all_obs_pos.reshape(self.num_envs, self.num_obstacles, 3)  # [num_envs, num_obstacles, 3]
+        
+        # 获取静态障碍物半径（从obstacle_radii）
+        # 🎯 修复：obstacle_radii存储的是所有环境的障碍物 [total_obstacles]
+        # 需要为每个环境提取对应的障碍物半径
+        if len(self.obstacle_radii) == self.num_envs * self.num_obstacles:
+            # obstacle_radii包含所有环境的障碍物，需要按环境提取
+            obstacle_radii_list = []
+            for env_idx in range(self.num_envs):
+                start_idx = env_idx * self.num_obstacles
+                end_idx = start_idx + self.num_obstacles
+                env_radii = self.obstacle_radii[start_idx:end_idx]  # [num_obstacles]
+                obstacle_radii_list.append(env_radii)
+            obstacle_radii = torch.stack(obstacle_radii_list, dim=0)  # [num_envs, num_obstacles]
+        elif len(self.obstacle_radii) == self.num_obstacles:
+            # obstacle_radii只包含单个环境的障碍物，扩展到所有环境
+            obstacle_radii = self.obstacle_radii.unsqueeze(0).expand(self.num_envs, -1)  # [num_envs, num_obstacles]
+        else:
+            # 形状不匹配，使用默认值
+            print(f"[Warning] obstacle_radii shape mismatch: {len(self.obstacle_radii)} != {self.num_obstacles} or {self.num_envs * self.num_obstacles}")
+            obstacle_radii = torch.full((self.num_envs, self.num_obstacles), 0.1, device=self.device)  # 默认半径0.1米
+        
+        # 批量旋转所有射线方向（完全GPU并行）
+        num_rays = self.lidar_hbeams * self.lidar_vbeams
+        
+        # 预扩展射线方向 [h_beams, v_beams, 3] → [num_envs, h_beams, v_beams, 3]
+        ray_dirs_local = self.ray_directions.unsqueeze(0).expand(self.num_envs, -1, -1, -1)
+        
+        # Reshape为 [num_envs * num_rays, 3] 用于批量旋转
+        ray_dirs_local_flat = ray_dirs_local.reshape(self.num_envs * num_rays, 3)
+        
+        # 扩展四元数：[num_envs, 4] → [num_envs * num_rays, 4]
+        ee_quat_expanded = ee_quat.unsqueeze(1).expand(-1, num_rays, -1).reshape(self.num_envs * num_rays, 4)
+        
+        # 一次性旋转所有射线（完全并行）
+        ray_dirs_world_flat = quat_rotate_vector_batch(ee_quat_expanded, ray_dirs_local_flat)
+        
+        # Reshape回 [num_envs, h_beams, v_beams, 3]
+        ray_dirs_world = ray_dirs_world_flat.reshape(self.num_envs, self.lidar_hbeams, self.lidar_vbeams, 3)
+        
+        # GPU并行计算所有射线与障碍物的碰撞（射线-球体相交）
+        # 扩展维度用于广播
+        ee_pos_2d = ee_pos.unsqueeze(1).unsqueeze(1)  # [num_envs, 1, 1, 3]
+        obs_pos_3d = obstacle_positions.unsqueeze(1).unsqueeze(1)  # [num_envs, 1, 1, num_obstacles, 3]
+        ray_dirs_4d = ray_dirs_world.unsqueeze(3)  # [num_envs, h_beams, v_beams, 1, 3]
+        
+        # 向量: 射线原点到球心
+        oc = obs_pos_3d - ee_pos_2d.unsqueeze(3)  # [num_envs, h_beams, v_beams, num_obstacles, 3]
+        
+        # 射线方向与oc的点积（沿射线的投影）
+        ray_to_center_proj = (ray_dirs_4d * oc).sum(dim=-1)  # [num_envs, h_beams, v_beams, num_obstacles]
+        
+        # 计算射线到球心的最短距离的平方
+        oc_norm_sq = (oc ** 2).sum(dim=-1)  # [num_envs, h_beams, v_beams, num_obstacles]
+        closest_dist_sq = oc_norm_sq - ray_to_center_proj ** 2  # [num_envs, h_beams, v_beams, num_obstacles]
+        
+        # 障碍物半径（扩展维度）
+        obstacle_radius = obstacle_radii.unsqueeze(1).unsqueeze(1)  # [num_envs, 1, 1, num_obstacles]
+        
+        # 击中条件：最短距离小于半径，且投影为正（在射线前方）
+        hit_mask = (closest_dist_sq <= obstacle_radius ** 2) & (ray_to_center_proj > 0)
+        
+        # 计算精确的击中距离（使用射线-球体相交公式）
+        discriminant = obstacle_radius ** 2 - closest_dist_sq
+        hit_distances = torch.where(
+            hit_mask,
+            ray_to_center_proj - torch.sqrt(discriminant.clamp(min=0)),
+            torch.full_like(ray_to_center_proj, self.lidar_range)
+        )
+        
+        # 确保距离为正
+        hit_distances = hit_distances.clamp(min=0, max=self.lidar_range)
+        
+        # 对每条射线，取所有障碍物中的最小距离
+        min_distance = hit_distances.min(dim=-1)[0]  # [num_envs, h_beams, v_beams]
+        
+        # 存储 LiDAR 扫描数据（模仿无人机: range - distance）
+        self.lidar_scan = (self.lidar_range - min_distance).unsqueeze(1)  # [num_envs, 1, h_beams, v_beams]
+        
+        # 限制在 [0, lidar_range]
+        self.lidar_scan = torch.clamp(self.lidar_scan, 0, self.lidar_range)
+
     def observe(self, voxel: Optional[torch.Tensor] = None, 
                 grid_origin: Optional[torch.Tensor] = None,
                 voxel_res: Optional[torch.Tensor] = None):
         """
-        18维观测空间（基于论文重新设计）：
-        1. 目标状态（4维）：检测状态、置信度、距离、水平方向
-        2. 机械臂状态（9维）：关节角度(6维)、位置误差向量(3维)
-        3. 感知信息（5维）：障碍物到5个连杆的最短距离
+        返回字典格式观测（参考无人机环境）：
+        - state: [num_envs, 18] - 18维观测空间（保持原来的格式）
+            1. 目标状态（4维）：检测状态、置信度、距离、水平方向
+            2. 机械臂状态（9维）：关节角度(6维)、位置误差向量(3维)
+            3. 感知信息（5维）：障碍物到5个连杆的最短距离
+        - lidar: [num_envs, 1, h_beams, v_beams] - LiDAR扫描数据
+        - dynamic_obstacle: [num_envs, 1, num_closest, 8] - 动态障碍物状态
         
         Args:
-            voxel: 当前体素地图 [1, 1, Vx, Vy, Vz] 或 [1, Vx, Vy, Vz] 或 [Vx, Vy, Vz]，用于推断障碍物距离
-            grid_origin: 体素网格原点 [3]，世界坐标
-            voxel_res: 体素分辨率 [3]，每个体素的尺寸（米）
+            voxel: 当前体素地图（已废弃，保留用于向后兼容）
+            grid_origin: 体素网格原点（已废弃，保留用于向后兼容）
+            voxel_res: 体素分辨率（已废弃，保留用于向后兼容）
         """
-        # 更新体素地图信息（用于障碍物距离计算）
-        if voxel is not None:
-            self.current_voxel = voxel
-        if grid_origin is not None:
-            self.voxel_grid_origin = grid_origin
-        if voxel_res is not None:
-            self.voxel_res = voxel_res
+        # 更新LiDAR扫描数据（如果启用）
+        if self.use_lidar_input:
+            try:
+                self._update_lidar()
+            except Exception as e:
+                print(f"[Warning] _update_lidar() failed: {e}")
+                import traceback
+                traceback.print_exc()
+                # 使用默认值
+                if self.lidar_scan is None:
+                    self.lidar_scan = torch.zeros((self.num_envs, 1, self.lidar_hbeams, self.lidar_vbeams), device=self.device)
         
         # 批量处理所有环境的观测 [num_envs, 3]
         ee = self.ee_pos  # [num_envs, 3]
@@ -1685,26 +1879,25 @@ class ArmNavEnv:
             print(f"[Env] Warning: target_pos contains NaN/inf in {invalid_tgt_mask.sum().item()} environments, replacing with origin")
             tgt = torch.where(torch.isnan(tgt) | torch.isinf(tgt), torch.zeros_like(tgt), tgt)
         
-        # 1. 目标状态（4维）- 批量处理 [num_envs, 4]
-        goal_detected = self.target_discovered.float().unsqueeze(1)  # [num_envs, 1]
-        goal_confidence = torch.where(self.target_discovered.unsqueeze(1), 
-                                      torch.tensor(0.9, device=self.device), 
-                                      torch.tensor(0.0, device=self.device))  # [num_envs, 1]
-        
-        # 计算距离，确保数值稳定（批量计算）
+        # 计算距离向量
         dist_vec = tgt - ee  # [num_envs, 3] 从末端指向目标
         goal_distance = torch.norm(dist_vec, dim=1, keepdim=True)  # [num_envs, 1]
         goal_distance = torch.where(torch.isnan(goal_distance) | torch.isinf(goal_distance),
                                    torch.tensor(1.0, device=self.device),
                                    goal_distance)
         
+        # 1. 目标状态（4维）- 批量处理 [num_envs, 4]
+        goal_detected = self.target_discovered.float().unsqueeze(1)  # [num_envs, 1]
+        goal_confidence = torch.where(self.target_discovered.unsqueeze(1), 
+                                      torch.tensor(0.9, device=self.device), 
+                                      torch.tensor(0.0, device=self.device))  # [num_envs, 1]
+        # goal_distance已在上面计算 [num_envs, 1]
         # 目标水平方向（简化：只用XY平面的角度）
         goal_direction_xy = torch.atan2(dist_vec[:, 1], dist_vec[:, 0]).unsqueeze(1)  # [num_envs, 1]
         
         # 2. 机械臂状态（9维）- 批量处理 [num_envs, 9]
         # 2.1 关节角度（6维）
         joint_positions = self.dof_states[:, 0].to(self.device).view(self.num_envs, self.dof_count)  # [num_envs, 6]
-        
         # 2.2 位置误差向量（3维）：目标位置 - 末端位置
         position_error = dist_vec  # [num_envs, 3]
         
@@ -1720,8 +1913,8 @@ class ArmNavEnv:
             traceback.print_exc()
             dobs = torch.full((self.num_envs, 5), 1.0, device=self.device)  # 默认1米
         
-        # 拼接所有观测（批量处理）
-        obs = torch.cat([
+        # 拼接state观测 [num_envs, 4+9+5=18]
+        state_obs = torch.cat([
             goal_detected,           # [num_envs, 1]  - 检测状态
             goal_confidence,         # [num_envs, 1]  - 置信度
             goal_distance,           # [num_envs, 1]  - 目标距离
@@ -1731,7 +1924,81 @@ class ArmNavEnv:
             dobs                     # [num_envs, 5]  - 障碍物到连杆距离
         ], dim=1)  # 最终 [num_envs, 18]
         
-        return obs  # 总长度: 1+1+1+1+6+3+5 = 18维
+        # 2. LiDAR观测（如果启用）
+        if self.use_lidar_input and self.lidar_scan is not None:
+            lidar_obs = self.lidar_scan  # [num_envs, 1, h_beams, v_beams]
+        else:
+            # 默认值
+            lidar_obs = torch.zeros((self.num_envs, 1, self.lidar_hbeams, self.lidar_vbeams), device=self.device)
+        
+        # 3. Dynamic Obstacle观测（参考无人机环境）
+        if self.num_dynamic_obstacles > 0 and self.dyn_obs_state is not None and self.dyn_obs_radii is not None:
+            # 计算每个环境最近的N个动态障碍物
+            dyn_obs_positions = self.dyn_obs_state[:, :3]  # [total_dyn_obs, 3]
+            dyn_obs_velocities = self.dyn_obs_state[:, 7:10] if self.dyn_obs_state.shape[1] >= 10 else torch.zeros((self.dyn_obs_state.shape[0], 3), device=self.device)  # [total_dyn_obs, 3]
+            
+            # 为每个环境计算最近的动态障碍物
+            dyn_obs_states_list = []
+            for env_idx in range(self.num_envs):
+                dyn_obs_start_idx = env_idx * self.num_dynamic_obstacles
+                dyn_obs_end_idx = (env_idx + 1) * self.num_dynamic_obstacles
+                
+                if dyn_obs_end_idx <= dyn_obs_positions.shape[0]:
+                    env_dyn_obs_pos = dyn_obs_positions[dyn_obs_start_idx:dyn_obs_end_idx]  # [num_dyn_obs, 3]
+                    env_dyn_obs_vel = dyn_obs_velocities[dyn_obs_start_idx:dyn_obs_end_idx]  # [num_dyn_obs, 3]
+                    env_dyn_obs_radii = self.dyn_obs_radii[dyn_obs_start_idx:dyn_obs_end_idx]  # [num_dyn_obs]
+                    
+                    # 计算相对位置
+                    dyn_obs_rpos = env_dyn_obs_pos - ee[env_idx:env_idx+1]  # [num_dyn_obs, 3]
+                    dyn_obs_distance = torch.norm(dyn_obs_rpos, dim=1)  # [num_dyn_obs]
+                    
+                    # 选择最近的N个
+                    num_closest = min(self.num_closest_dyn_obs, len(dyn_obs_distance))
+                    if num_closest > 0:
+                        _, closest_idx = torch.topk(dyn_obs_distance, num_closest, largest=False)
+                        closest_dyn_obs_rpos = dyn_obs_rpos[closest_idx]  # [num_closest, 3]
+                        closest_dyn_obs_vel = env_dyn_obs_vel[closest_idx]  # [num_closest, 3]
+                        closest_dyn_obs_distance = dyn_obs_distance[closest_idx]  # [num_closest]
+                        closest_dyn_obs_radii = env_dyn_obs_radii[closest_idx]  # [num_closest]
+                        
+                        # 归一化相对位置
+                        closest_dyn_obs_rpos_norm = closest_dyn_obs_rpos / closest_dyn_obs_distance.unsqueeze(1).clamp(min=1e-6)  # [num_closest, 3]
+                        
+                        # 拼接动态障碍物状态 [num_closest, 3+3+1+1=8]
+                        env_dyn_obs_state = torch.cat([
+                            closest_dyn_obs_rpos_norm,      # [num_closest, 3] 归一化相对位置
+                            closest_dyn_obs_vel,            # [num_closest, 3] 速度
+                            closest_dyn_obs_distance.unsqueeze(1),  # [num_closest, 1] 距离
+                            closest_dyn_obs_radii.unsqueeze(1)      # [num_closest, 1] 半径
+                        ], dim=1)  # [num_closest, 8]
+                        
+                        # 如果数量不足，用零填充
+                        if num_closest < self.num_closest_dyn_obs:
+                            padding = torch.zeros((self.num_closest_dyn_obs - num_closest, 8), device=self.device)
+                            env_dyn_obs_state = torch.cat([env_dyn_obs_state, padding], dim=0)
+                    else:
+                        env_dyn_obs_state = torch.zeros((self.num_closest_dyn_obs, 8), device=self.device)
+                else:
+                    env_dyn_obs_state = torch.zeros((self.num_closest_dyn_obs, 8), device=self.device)
+                
+                dyn_obs_states_list.append(env_dyn_obs_state)
+            
+            # 拼接所有环境的动态障碍物状态 [num_envs, num_closest, 8]
+            dyn_obs_states = torch.stack(dyn_obs_states_list, dim=0)  # [num_envs, num_closest, 8]
+            # 添加batch维度以匹配无人机格式 [num_envs, 1, num_closest, 8]
+            dyn_obs_states = dyn_obs_states.unsqueeze(1)
+        else:
+            # 默认值
+            dyn_obs_states = torch.zeros((self.num_envs, 1, self.num_closest_dyn_obs, 8), device=self.device)
+        
+        # 返回字典格式观测（参考无人机环境）
+        obs = {
+            "state": state_obs,           # [num_envs, 18] - 18维观测空间（包含ArUco检测状态）
+            "lidar": lidar_obs,           # [num_envs, 1, h_beams, v_beams]
+            "dynamic_obstacle": dyn_obs_states  # [num_envs, 1, num_closest, 8]
+        }
+        
+        return obs
 
     def step(self, action_xyz: torch.Tensor):
         """
@@ -1789,6 +2056,13 @@ class ArmNavEnv:
         
         # 更新障碍物位置（障碍物可能移动，虽然当前是静态的）
         self._update_obstacle_positions()
+        
+        # 更新LiDAR扫描数据（如果启用）
+        if self.use_lidar_input:
+            try:
+                self._update_lidar()
+            except Exception as e:
+                print(f"[Warning] _update_lidar() failed in step(): {e}")
         
         # 更新动态障碍物位置（如果启用）
         # 🎯 重要：在 _read_wrist_pose() 之后调用，确保 ee_pos 已更新
