@@ -31,7 +31,7 @@ env:
   # LiDAR (替代体素输入；安装在末端执行器坐标系)
   use_lidar_input: true            # 使用LiDAR+动态障碍作为感知输入
   lidar_range: 3.0                 # LiDAR最大量程（米）
-  lidar_vfov: [-10.0, 10.0]        # 垂直视场角（度）
+  lidar_vfov: [-15.0, 15.0]        # 垂直视场角（度）
   lidar_vbeams: 4                  # 垂直光束数
   lidar_hres: 10.0                 # 水平分辨率（度）；水平光束数=360/分辨率
   
@@ -40,7 +40,7 @@ env:
   aruco_render_freq: 5             # 取图频率（每N步渲染一次相机），降低争用
   
   action_dim: 6                    # 关节角度增量维度 [dq1, dq2, dq3, dq4, dq5, dq6]（弧度）
-  action_limit: 0.1                # 关节角度增量限制（弧度/步）- 增大以鼓励更大的动作幅度
+  action_limit: 0.08                # 关节角度增量限制（弧度/步）- 增大以鼓励更大的动作幅度
   
   # PD控制器参数（位置控制模式）
   # 前3个关节（shoulder_pan, shoulder_lift, elbow）
@@ -83,43 +83,53 @@ env:
   dynamic_obstacle_local_range: [0.4, 0.4, 0.3]  # 局部移动范围 [x, y, z]（相对于原点）
   dynamic_obstacle_goal_threshold: 0.2  # 到达目标的距离阈值（m）
   dynamic_obstacle_vel_update_interval: 2.0  # 速度更新间隔（秒）
-  num_closest_dyn_obs: 3  # 检测最近的N个动态障碍物（参考isaac-training，提高效率）
+  num_closest_dyn_obs: 1  # 检测最近的N个动态障碍物（参考isaac-training，提高效率）
 
 # rewards (简化的两阶段奖励系统)
 reward:
   # === 论文核心参数 ===
   # 障碍物惩罚（论文公式：ω2·Σψi）
-  omega2: 0.1                    # 障碍物惩罚系数
-  d_max: 0.05                    # 安全距离阈值（5cm）
+  omega2: 0.15                   # 障碍物惩罚系数（降低以避免过度惩罚）
+  d_max: 0.1                    # 安全距离阈值（10cm）
   # === 发现ArUco后的靠近奖励（端到端到达目标奖励） ===
   # 只在发现目标后应用，鼓励机械臂靠近并到达目标
+  # 公式：
   # 1. 位置误差惩罚: -ω₁e² (误差越大，惩罚越大)
   # 2. 零误差鼓励: ln(e² + τₑ) (误差越小，奖励越大；误差为0时奖励最大)
   # e = ||pt - pe|| (末端执行器与目标的欧氏距离)
-  omega1: 0.001                  # 误差权重系数（10^-3）
-  tau_e: 0.0001                  # 误差阈值（10^-4）
+  omega1: 1.0                     # 误差权重系数（增大以提高靠近奖励梯度）
+  tau_e: 2.0                     # 误差阈值（增大以使ln(e²+τₑ)在接近目标时为正）
+  
+  # === 成功奖励 ===
+  success_reward: 50.0           # 成功到达目标时的额外奖励（一次性，降低以避免稀疏奖励）
+  success_distance: 0.1          # 成功距离阈值（10cm）
   
   # === 简化奖励参数 ===
   # 探索奖励（未发现阶段）
   wrist_movement_coef: 2.0       # 末端平移奖励（避免静止）
-  view_change_coef: 0.15         # 相机朝向变化奖励
+  view_change_coef: 0.0          # 相机朝向变化奖励（已修复：在已发现目标时无效，设为0）
   
   # === 发现和多角度观察奖励 ===
-  discovery_bonus: 100.0             # 目标发现奖励（一次性）
-  new_angle_bonus: 0.2             # 新角度观察奖励（30度差异视为新角度）
+  discovery_bonus: 20.0             # 目标发现奖励（一次性，降低以避免稀疏奖励）
+  new_angle_bonus: 1.0             # 新角度观察奖励（30度差异视为新角度，增大以鼓励多角度观察）
   multiview_movement_bonus: 0.1    # 多角度观察时的运动奖励（末端摆动）
-  multiview_continuation_bonus: 0.05  # 持续多角度观察奖励（前10步递增）
-  angle_coverage_bonus: 0.15       # 多角度覆盖奖励（观察到4+个角度）
+  multiview_movement_scale: 50.0   # 多角度观察运动奖励的放大系数（硬编码修复）
+  multiview_continuation_bonus: 0.5  # 持续多角度观察奖励（前N步递增，增大以鼓励持续观察）
+  multiview_continuation_steps: 10  # 持续观察奖励达到最大值的步数（硬编码修复）
+  angle_coverage_bonus: 0.5       # 多角度覆盖奖励（观察到4+个角度，增大以鼓励多角度观察）
+  angle_coverage_normalize: 8.0    # 多角度覆盖奖励的归一化系数（硬编码修复）
   multiview_angle_threshold: 30.0  # 新角度阈值（度，小于此值视为同一角度）
   
   # === 末端转动奖励（在未知条件下，鼓励末端多角度探索） ===
-  wrist_rotation_coef: 25.0        # 末端转动奖励系数（基础旋转奖励）- 进一步增大以鼓励更多旋转
+  wrist_rotation_coef: 5.0        # 末端转动奖励系数（基础旋转奖励）- 进一步增大以鼓励更多旋转
   wrist_rotation_threshold: 0.05    # 最小旋转阈值（度，小于此值不奖励）- 进一步降低阈值使更容易触发奖励
-  wrist_rotation_continuation_coef: 12.0  # 连续转动奖励系数（鼓励持续转动）- 进一步增大以鼓励持续旋转
-  wrist_no_rotation_penalty: 100.0  # 末端不转动惩罚系数（在未知条件下，如果末端不转动则惩罚）- 进一步增大惩罚以强制旋转
+  wrist_rotation_max_angle: 180.0  # 旋转角度归一化的最大值（度，硬编码修复）
+  wrist_rotation_continuation_coef: 5.0  # 连续转动奖励系数（鼓励持续转动）- 进一步增大以鼓励持续旋转
+  wrist_rotation_continuation_steps: 5  # 连续转动奖励达到最大值的步数（硬编码修复）
+  wrist_no_rotation_penalty: 8.0  # 末端不转动惩罚系数（降低以避免过度旋转）
   
   # === Z轴向上探索奖励（在未知条件下，鼓励向上探索） ===
-  upward_exploration_coef: 10.0    # Z轴向上探索奖励系数
+  upward_exploration_coef: 5.0    # Z轴向上探索奖励系数
   upward_exploration_threshold: 0.01  # 最小向上移动阈值（米，小于此值不奖励）
   upward_exploration_max_reward_height: 1.0  # 最大奖励的高度阈值（米，超过此高度不再额外奖励）
 
@@ -172,7 +182,7 @@ ppo:
 
 # train
 train:
-  total_iterations: 5000
-  log_interval: 10
-  save_interval: 100
+  total_iterations: 100000
+  log_interval: 16
+  save_interval: 500
   checkpoint_dir: checkpoints_active_training

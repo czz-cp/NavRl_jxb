@@ -1266,6 +1266,11 @@ class ArmNavEnv:
         self.prev_discovery_state.zero_()
         self.prev_dist = None
         self.prev_visit_key = None
+        # 重置成功奖励标志位
+        if hasattr(self, '_success_reward_given'):
+            self._success_reward_given.zero_()
+        else:
+            self._success_reward_given = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
         
         # 重置渐进式安全奖励相关状态
         self._should_terminate.zero_()
@@ -2804,6 +2809,19 @@ class ArmNavEnv:
             except Exception as e:
                 print(f"[Warning] Failed to compute approaching rewards: {e}")
         
+        # 4. 成功奖励（一次性，当到达目标时）
+        try:
+            success_reward = self._compute_success_reward(cfg)  # [N]
+            if success_reward.shape[0] == N:
+                total_reward += success_reward
+            else:
+                if success_reward.shape[0] > N:
+                    total_reward += success_reward[:N]
+                else:
+                    total_reward[:success_reward.shape[0]] += success_reward
+        except Exception as e:
+            print(f"[Warning] Failed to compute success rewards: {e}")
+        
         # 计算当前角度（用于角度塑形）
         try:
             rel = (self.target_pos - self.ee_pos)
@@ -2864,8 +2882,8 @@ class ArmNavEnv:
                     link_distances = link_distances_padded
             
             # 论文参数
-            omega2 = cfg['reward'].get('omega2', 0.1)  # 障碍物惩罚系数
-            d_max = cfg['reward'].get('d_max', 0.05)   # 安全距离阈值（5cm）
+            omega2 = cfg['reward'].get('omega2', 0.15)  # 障碍物惩罚系数
+            d_max = cfg['reward'].get('d_max', 0.1)   # 安全距离阈值（10cm，与config.yaml一致）
             
             # 计算每个连杆的惩罚系数 ψi
             # ψi = max(0, 1 - d/d_max) when d < d_max
@@ -3009,8 +3027,8 @@ class ArmNavEnv:
                 return reward  # 没有环境发现目标，返回零奖励
             
             # 获取配置参数
-            omega1 = cfg['reward'].get('omega1', 0.001)  # 10^-3 误差权重系数
-            tau_e = cfg['reward'].get('tau_e', 0.0001)   # 10^-4 误差阈值
+            omega1 = cfg['reward'].get('omega1', 1.0)  # 误差权重系数（与config.yaml一致）
+            tau_e = cfg['reward'].get('tau_e', 2.0)   # 误差阈值
             
             # 计算末端执行器与目标的欧氏距离
             error = torch.norm(self.target_pos - self.ee_pos, dim=1)  # [N]
@@ -3020,7 +3038,6 @@ class ArmNavEnv:
             position_error_penalty = -omega1 * error_squared
             
             # 零误差鼓励: ln(e² + τₑ) (正数，误差越小奖励越大)
-            # 注意：当 e=0 时，ln(τₑ) ≈ -9.21，但相对误差惩罚来说这是奖励项
             zero_error_encouragement = torch.log(error_squared + tau_e)
             
             # 组合到达目标奖励
@@ -3036,6 +3053,66 @@ class ArmNavEnv:
                 
         except Exception as e:
             print(f"[Warning] _compute_approaching_reward failed: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return reward
+    
+    def _compute_success_reward(self, cfg: dict) -> torch.Tensor:
+        """
+        成功奖励（一次性，当到达目标时）
+        
+        当末端执行器距离目标小于success_distance时，给予一次性大奖励。
+        使用标志位避免重复奖励。
+        
+        Args:
+            cfg: 配置字典
+        
+        Returns:
+            [N] 成功奖励张量（只对成功到达目标的环境应用一次）
+        """
+        N = self.num_envs
+        reward = torch.zeros(N, device=self.device)
+        
+        try:
+            # 获取配置参数
+            success_reward = cfg['reward'].get('success_reward', 100.0)  # 成功奖励值
+            success_distance = cfg['reward'].get('success_distance', 0.1)  # 成功距离阈值
+            
+            # 计算末端执行器与目标的欧氏距离
+            error = torch.norm(self.target_pos - self.ee_pos, dim=1)  # [N]
+            
+            # 检查是否成功到达目标
+            success_mask = error < success_distance  # [N]
+            
+            # 初始化成功标志位（如果不存在）
+            if not hasattr(self, '_success_reward_given'):
+                self._success_reward_given = torch.zeros(N, dtype=torch.bool, device=self.device)
+            
+            # 确保标志位形状正确
+            if self._success_reward_given.shape[0] != N:
+                if self._success_reward_given.shape[0] > N:
+                    self._success_reward_given = self._success_reward_given[:N]
+                else:
+                    padding = torch.zeros(N - self._success_reward_given.shape[0], dtype=torch.bool, device=self.device)
+                    self._success_reward_given = torch.cat([self._success_reward_given, padding])
+            
+            # 只对首次成功到达的环境给予奖励
+            newly_successful = success_mask & (~self._success_reward_given)  # [N]
+            
+            # 给予成功奖励
+            reward[newly_successful] = success_reward
+            
+            # 更新标志位
+            self._success_reward_given[newly_successful] = True
+            
+            # 检查 NaN/Inf
+            if torch.isnan(reward).any() or torch.isinf(reward).any():
+                nan_mask = torch.isnan(reward) | torch.isinf(reward)
+                reward[nan_mask] = 0.0
+                
+        except Exception as e:
+            print(f"[Warning] _compute_success_reward failed: {e}")
             import traceback
             traceback.print_exc()
         
@@ -3173,20 +3250,23 @@ class ArmNavEnv:
             
             # 末端关节运动越大，视角变化越大
             multiview_movement_bonus = cfg['reward'].get('multiview_movement_bonus', 0.1)
-            reward[i] += multiview_movement_bonus * wrist_movement * 50.0
+            multiview_movement_scale = cfg['reward'].get('multiview_movement_scale', 50.0)
+            reward[i] += multiview_movement_bonus * wrist_movement * multiview_movement_scale
             
             # 4. 持续观察奖励（鼓励持续多角度观察）
             multiview_continuation_bonus = cfg['reward'].get('multiview_continuation_bonus', 0.05)
-            steps_factor = torch.clamp(self.multiview_steps[i].float() / 10.0, max=1.0).item()
+            multiview_continuation_steps = cfg['reward'].get('multiview_continuation_steps', 10)
+            steps_factor = torch.clamp(self.multiview_steps[i].float() / float(multiview_continuation_steps), max=1.0).item()
             reward[i] += multiview_continuation_bonus * steps_factor
             
             
             # 5. 多角度覆盖奖励（观察角度越多，奖励越大）
             angle_coverage_bonus = cfg['reward'].get('angle_coverage_bonus', 0.15)
+            angle_coverage_normalize = cfg['reward'].get('angle_coverage_normalize', 8.0)
             num_unique_angles = len(angles_list)
             # 如果观察到4个以上不同角度，给予额外奖励
             if num_unique_angles >= 4:
-                reward[i] += angle_coverage_bonus * (num_unique_angles / 8.0)
+                reward[i] += angle_coverage_bonus * (num_unique_angles / angle_coverage_normalize)
         
         return reward
     
@@ -3315,17 +3395,20 @@ class ArmNavEnv:
             
             # 只奖励超过阈值的环境
             valid_rotation_mask = rotation_angle_deg > rotation_threshold
-            if valid_rotation_mask.any():
+            # 🎯 修复：基础旋转奖励只对未发现目标的环境应用（避免与view_change_coef重复）
+            unknown_mask = ~self.target_discovered  # [num_envs]
+            valid_rotation_and_unknown_mask = valid_rotation_mask & unknown_mask
+            if valid_rotation_and_unknown_mask.any():
                 # 🎯 优化：使用平方函数，大幅奖励大角度旋转
                 # 归一化到 [0, 1]，使用平方以鼓励更大角度的旋转
-                normalized_rotation = torch.clamp(rotation_angle_deg / 180.0, max=1.0)
+                rotation_max_angle = cfg['reward'].get('wrist_rotation_max_angle', 180.0)
+                normalized_rotation = torch.clamp(rotation_angle_deg / rotation_max_angle, max=1.0)
                 # 使用平方使大角度获得更多奖励，鼓励大幅旋转
-                reward_factor = normalized_rotation[valid_rotation_mask] ** 1.5  # 使用1.5次方，介于线性和平方之间
+                reward_factor = normalized_rotation[valid_rotation_and_unknown_mask] ** 1.5  # 使用1.5次方，介于线性和平方之间
                 # 🎯 增大基础奖励，确保即使小角度也有足够的激励，但大角度奖励更多
-                reward[valid_rotation_mask] = rotation_coef * (0.2 + 0.8 * reward_factor)  # 最小20%奖励，最多100%，大角度奖励更高
+                reward[valid_rotation_and_unknown_mask] = rotation_coef * (0.2 + 0.8 * reward_factor)  # 最小20%奖励，最多100%，大角度奖励更高
             
             # 🎯 添加末端不转动惩罚（在未知条件下）
-            unknown_mask = ~self.target_discovered  # [num_envs]
             no_rotation_mask = (rotation_angle_deg <= rotation_threshold) & unknown_mask  # 未转动且未发现目标
             if no_rotation_mask.any():
                 no_rotation_penalty_coef = cfg['reward'].get('wrist_no_rotation_penalty', 0.01)  # 不转动惩罚系数
@@ -3336,8 +3419,7 @@ class ArmNavEnv:
             # 2. 连续转动奖励：如果连续多步都在转动，给予额外奖励
             # 🎯 注意：只对未发现目标的环境更新计数器（因为只对它们应用奖励）
             if hasattr(self, 'wrist_rotation_steps'):
-                # 只对未发现目标的环境更新计数器
-                unknown_mask = ~self.target_discovered  # [num_envs]
+                # 注意：unknown_mask 已在上面定义，这里不需要重复定义
                 # 增加转动步数计数器（只对有效转动且未发现目标的环境）
                 valid_and_unknown_mask = valid_rotation_mask & unknown_mask
                 self.wrist_rotation_steps[valid_and_unknown_mask] += 1
@@ -3346,8 +3428,9 @@ class ArmNavEnv:
                 
                 # 连续转动奖励（只对有效转动且未发现目标的环境应用）
                 continuation_coef = cfg['reward'].get('wrist_rotation_continuation_coef', 0.02)
+                continuation_steps = cfg['reward'].get('wrist_rotation_continuation_steps', 5)
                 # 🎯 优化：更快达到最大奖励（从10步改为5步），并增加奖励幅度
-                steps_factor = torch.clamp(self.wrist_rotation_steps.float() / 5.0, max=1.0)  # 更快达到最大值
+                steps_factor = torch.clamp(self.wrist_rotation_steps.float() / float(continuation_steps), max=1.0)  # 更快达到最大值
                 # 使用平方根使奖励增长更平滑
                 steps_reward_factor = torch.sqrt(steps_factor[valid_and_unknown_mask])
                 # 只对有效转动且未发现目标的环境应用连续转动奖励
@@ -4954,6 +5037,9 @@ class ArmNavEnv:
             self.target_discovered[i] = 0
             self.wrist_rotation_steps[i] = 0  # 重置末端转动步数计数器
             self.steps_since_last_detection[i] = 0
+            # 重置成功奖励标志位
+            if hasattr(self, '_success_reward_given') and i < self._success_reward_given.shape[0]:
+                self._success_reward_given[i] = False
             self.last_detection_step[i] = 0
             self.danger_count[i] = 0
             self._should_terminate[i] = False
