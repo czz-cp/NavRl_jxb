@@ -293,6 +293,7 @@ def main():
         # 🎯 重要：在配置设置完成后创建动态障碍物
         print(f"[Train] 正在创建动态障碍物...")
         env._spawn_dynamic_obstacles()
+        env.test_dynamic_obstacles_visibility()  # 🎯 添加测试
         print(f"[Train] 动态障碍物创建完成")
     env.workspace_radius = env_cfg.get('workspace_radius', 1.4)
     env.workspace_z = env_cfg.get('workspace_z', [0.05, 1.2])
@@ -405,6 +406,9 @@ def main():
     test_voxel_preparation(logger, env.num_envs, voxel_shape, Vx, Vy, Vz, cfg['voxel']['channels'])
     logger.log("体素处理函数测试通过！")
 
+    # 🎯 初始化深度图缓存（用于aruco_render_freq控制）
+    last_depth_cache = {'depth': None, 'cam_T_w': None, 'intr': None}
+    
     for it in range(1, total_iters + 1):#总迭代次数
         print(f"\n[Iteration {it}/{total_iters}] Starting rollout collection...")
         
@@ -482,9 +486,32 @@ def main():
                     aux = obs
             else:
                 # 不启用viewer且不使用LiDAR时，正常执行所有操作（使用体素地图）
-                depth = env.render_depth()#渲染深度图
-                cam_T_w = env.camera_pose()
-                intr = env.intrinsics#相机内参矩阵
+                # 🎯 使用aruco_render_freq控制渲染频率（从config读取）
+                aruco_render_freq = getattr(env, 'aruco_render_freq', env_cfg.get('aruco_render_freq', 5))
+                if t % aruco_render_freq == 0 or t == 0:
+                    # 只在满足频率条件时渲染深度图
+                    depth = env.render_depth()#渲染深度图
+                    cam_T_w = env.camera_pose()
+                    intr = env.intrinsics#相机内参矩阵
+                    # 缓存最新的深度图（用于后续步骤）
+                    last_depth_cache['depth'] = depth
+                    last_depth_cache['cam_T_w'] = cam_T_w
+                    last_depth_cache['intr'] = intr
+                else:
+                    # 不渲染时，使用上一次缓存的深度图
+                    if last_depth_cache['depth'] is None:
+                        # 第一次调用或缓存未初始化，必须渲染
+                        depth = env.render_depth()
+                        cam_T_w = env.camera_pose()
+                        intr = env.intrinsics
+                        last_depth_cache['depth'] = depth
+                        last_depth_cache['cam_T_w'] = cam_T_w
+                        last_depth_cache['intr'] = intr
+                    else:
+                        # 使用缓存的深度图
+                        depth = last_depth_cache['depth']
+                        cam_T_w = last_depth_cache['cam_T_w']
+                        intr = last_depth_cache['intr']
                 
                 # 🎯 调试：检查深度图
                 if t == 0 and it == 1:
@@ -993,6 +1020,7 @@ def main():
                 last_voxel = prepare_voxel_for_training(voxel, num_envs, voxel_shape)
             else:
                 # 不启用viewer且不使用LiDAR时，正常执行所有操作（使用体素地图）
+                # 🎯 最后一次rollout步骤，总是渲染（不使用频率控制）
                 depth = env.render_depth()
                 cam_T_w = env.camera_pose()
                 intr = env.intrinsics
@@ -1087,12 +1115,12 @@ def main():
         # 🎯 如果使用nav_style_features，添加obs_dict到traj
         if use_nav_style_features and obs_dicts is not None and len(obs_dicts) > 0:
             # 将obs_dicts列表转换为字典格式的tensor
-            # obs_dicts是长度为T的列表，每个元素是字典 {state, lidar, dynamic_obstacle}
+            # obs_dicts是长度为T的列表，每个元素是字典 {state, lidar}（已禁用 dynamic_obstacle）
             # 🎯 修复：确保tensor可以用于反向传播（从推理模式转换）
             traj['obs_dict'] = {
                 'state': torch.stack([obs['state'] for obs in obs_dicts], dim=0).view(-1, aux_dim_val).clone().detach().requires_grad_(False),  # [T*N, state_dim]
                 'lidar': torch.stack([obs['lidar'] for obs in obs_dicts], dim=0).view(-1, *obs_dicts[0]['lidar'].shape[1:]).clone().detach().requires_grad_(False),  # [T*N, 1, h_beams, v_beams]
-                'dynamic_obstacle': torch.stack([obs['dynamic_obstacle'] for obs in obs_dicts], dim=0).view(-1, *obs_dicts[0]['dynamic_obstacle'].shape[1:]).clone().detach().requires_grad_(False),  # [T*N, 1, num_closest, 8]
+                # 🎯 已禁用动态障碍物：不再包含 dynamic_obstacle
             }
         # 训练更新
         print(f"[Training] Updating policy (iter {it}/{total_iters})...")
@@ -1143,7 +1171,7 @@ def main():
         logger.save_stats(it, stats_dict)
         
         # 🎯 调试：保存每10次迭代的中间状态
-        if it % 10 == 0:
+        if it % 16 == 0:
             logger.save_state("rewards", rews, iteration=it)
             logger.save_state("values", vals, iteration=it)
             logger.save_state("advantages", adv, iteration=it)

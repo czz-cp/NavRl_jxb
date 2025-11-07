@@ -348,7 +348,7 @@ class PPO:
             ).to(device)
             fused_dim = 256
         else:
-            # ========== LiDAR + DynObs + State 分支（仿照 isaac-training，无注意力） ==========
+            # ========== LiDAR + State 分支（已禁用动态障碍物） ==========
             # LiDAR CNN
             self.lidar_cnn = nn.Sequential(
                 nn.Conv2d(1, 4, kernel_size=(5,3), padding=(2,1)), nn.ELU(),
@@ -357,18 +357,10 @@ class PPO:
                 nn.Flatten(),
                 nn.LazyLinear(128), nn.LayerNorm(128)
             ).to(device)
-            # 动态障碍 MLP（输入展平）
-            # 动态障碍物格式: [B, 1, num_closest, 8] -> 展平后 [B, num_closest * 8]
-            # 假设 num_closest=3，则输入维度为 3*8=24
-            num_closest_dyn_obs = cfg.get('num_closest_dyn_obs', 3)  # 从配置读取，默认3
-            dyn_obs_input_dim = num_closest_dyn_obs * 8  # 每个动态障碍物8维
-            self.dyn_obs_mlp = nn.Sequential(
-                nn.Flatten(),
-                nn.Linear(dyn_obs_input_dim, 128), nn.ELU(), nn.Linear(128, 64)
-            ).to(device)
-            # 融合：cnn(128) + state(aux_dim) + dyn(64)
+            # 🎯 已禁用动态障碍物：不再创建 dyn_obs_mlp
+            # 融合：cnn(128) + state(aux_dim)
             self.fusion = nn.Sequential(
-                nn.Linear(128 + aux_dim + 64, 256),
+                nn.Linear(128 + aux_dim, 256),
                 nn.ELU(inplace=True),
                 nn.BatchNorm1d(256)
             ).to(device)
@@ -389,7 +381,8 @@ class PPO:
         if not self.use_nav_style_features:
             feat_params = list(self.backbone.parameters()) + list(self.auxiliary_net.parameters()) + list(self.fusion.parameters())
         else:
-            feat_params = list(self.lidar_cnn.parameters()) + list(self.dyn_obs_mlp.parameters()) + list(self.fusion.parameters())
+            # 🎯 已禁用动态障碍物：只使用 lidar_cnn 和 fusion
+            feat_params = list(self.lidar_cnn.parameters()) + list(self.fusion.parameters())
         self.feature_optim = optim.Adam(feat_params, lr=feat_lr)
         self.actor_optim = optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_optim = optim.Adam(self.critic.parameters(), lr=critic_lr)
@@ -429,12 +422,12 @@ class PPO:
         """
         🎯 特征融合：
         - 默认：voxel+aux
-        - nav-style：obs_dict={state, lidar, dyn_obs}
+        - nav-style：obs_dict={state, lidar}（已禁用动态障碍物）
         
         Args:
             voxel: [B, 1, 32, 32, 32]
             aux: [B, aux_dim]
-            obs_dict: { 'state':[B,aux_dim], 'lidar':[B,1,W,H], 'dyn_obs':[B,1,K,10] }
+            obs_dict: { 'state':[B,aux_dim], 'lidar':[B,1,W,H] }
         
         Returns:
             fused: [B, 256] 融合后的特征
@@ -454,7 +447,7 @@ class PPO:
         else:
             state = obs_dict['state']
             lidar = obs_dict['lidar']
-            dyn_obs = obs_dict.get('dynamic_obstacle', obs_dict.get('dyn_obs', None))  # 支持两种键名
+            # 🎯 已禁用动态障碍物：不再使用动态障碍物特征
             
             # 🎯 修复：确保tensor可以用于反向传播（从推理模式转换）
             # 使用 enable_grad() 上下文确保可以计算梯度
@@ -462,11 +455,9 @@ class PPO:
                 # 创建新的tensor，确保不在推理模式
                 state = state.clone().detach().requires_grad_(False)
                 lidar = lidar.clone().detach().requires_grad_(False)
-                if dyn_obs is not None:
-                    dyn_obs = dyn_obs.clone().detach().requires_grad_(False)
             
             # 规范数值
-            for t in [state, lidar, dyn_obs]:
+            for t in [state, lidar]:
                 if t is not None:
                     if torch.isnan(t).any() or torch.isinf(t).any():
                         t = torch.where(torch.isnan(t) | torch.isinf(t), torch.zeros_like(t), t)
@@ -474,15 +465,9 @@ class PPO:
             # LiDAR CNN: 期望 [B,1,W,H]，其中W=h_beams, H=v_beams
             lidar_feat = self.lidar_cnn(lidar)  # [B, 128]
             
-            # 动态障碍物处理: [B, 1, num_closest, 8] -> 展平 -> MLP
-            if dyn_obs is not None:
-                dyn_feat = self.dyn_obs_mlp(dyn_obs)  # [B, 64]
-            else:
-                # 如果没有动态障碍物，使用零向量
-                dyn_feat = torch.zeros((state.shape[0], 64), device=state.device)
-            
-            # 融合: cnn(128) + state(state_dim) + dyn(64)
-            fused = self.fusion(torch.cat([lidar_feat, state, dyn_feat], dim=1))  # [B, 256]
+            # 🎯 已禁用动态障碍物：只融合 lidar + state
+            # 融合: cnn(128) + state(state_dim)
+            fused = self.fusion(torch.cat([lidar_feat, state], dim=1))  # [B, 192] (128 + state_dim)
         
         # 检查融合后的特征
         if torch.isnan(fused).any() or torch.isinf(fused).any():
@@ -759,11 +744,12 @@ class PPO:
                                                    torch.zeros_like(traj[key]), traj[key])
                 # 🎯 检查obs_dict（如果存在）
                 if 'obs_dict' in traj:
-                    for key in ['state', 'lidar', 'dynamic_obstacle']:
+                    # 🎯 已禁用动态障碍物：只检查 state 和 lidar
+                    for key in ['state', 'lidar']:
                         if key in traj['obs_dict']:
                             if torch.isnan(traj['obs_dict'][key]).any() or torch.isinf(traj['obs_dict'][key]).any():
                                 print(f"[PPO] Warning: traj['obs_dict']['{key}'] contains NaN/inf in epoch {epoch}, replacing with zeros")
-                                traj['obs_dict'][key] = torch.where(torch.isnan(traj['obs_dict'][key]) | torch.isinf(traj['obs_dict'][key]), 
+                                traj['obs_dict'][key] = torch.where(torch.isnan(traj['obs_dict'][key]) | torch.isinf(traj['obs_dict'][key]),
                                                                    torch.zeros_like(traj['obs_dict'][key]), traj['obs_dict'][key])
             
             for s in range(0, B, self.batch_size):
@@ -773,10 +759,10 @@ class PPO:
                     # 🎯 修复：确保batch tensor可以用于反向传播
                     # 使用 enable_grad() 上下文确保可以计算梯度
                     with torch.enable_grad():
+                        # 🎯 已禁用动态障碍物：只包含 state 和 lidar
                         obs_dict_batch = {
                             'state': traj['obs_dict']['state'][b].clone().detach().requires_grad_(False),
                             'lidar': traj['obs_dict']['lidar'][b].clone().detach().requires_grad_(False),
-                            'dynamic_obstacle': traj['obs_dict']['dynamic_obstacle'][b].clone().detach().requires_grad_(False),
                         }
                     logp, ent, v = self.evaluate(None, None, traj['act'][b], obs_dict=obs_dict_batch)
                 else:
@@ -868,15 +854,11 @@ class PPO:
                                 print(f"[PPO] Warning: backbone.{name} gradient contains NaN/inf, zeroing...")
                                 param.grad.zero_()
                 else:
+                    # 🎯 已禁用动态障碍物：只检查 lidar_cnn
                     for name, param in self.lidar_cnn.named_parameters():
                         if param.grad is not None:
                             if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
                                 print(f"[PPO] Warning: lidar_cnn.{name} gradient contains NaN/inf, zeroing...")
-                                param.grad.zero_()
-                    for name, param in self.dyn_obs_mlp.named_parameters():
-                        if param.grad is not None:
-                            if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                                print(f"[PPO] Warning: dyn_obs_mlp.{name} gradient contains NaN/inf, zeroing...")
                                 param.grad.zero_()
                 
                 for name, param in self.actor.named_parameters():
@@ -896,9 +878,8 @@ class PPO:
                 if not self.use_nav_style_features:
                     grad_norm_backbone = nn.utils.clip_grad_norm_(self.backbone.parameters(), max_grad_norm_isaac)
                 else:
-                    grad_norm_lidar = nn.utils.clip_grad_norm_(self.lidar_cnn.parameters(), max_grad_norm_isaac)
-                    grad_norm_dyn = nn.utils.clip_grad_norm_(self.dyn_obs_mlp.parameters(), max_grad_norm_isaac)
-                    grad_norm_backbone = max(grad_norm_lidar, grad_norm_dyn)  # 使用最大值作为特征范数
+                    # 🎯 已禁用动态障碍物：只裁剪 lidar_cnn
+                    grad_norm_backbone = nn.utils.clip_grad_norm_(self.lidar_cnn.parameters(), max_grad_norm_isaac)
                 grad_norm_actor_batch = nn.utils.clip_grad_norm_(self.actor.parameters(), max_grad_norm_isaac)
                 grad_norm_critic_batch = nn.utils.clip_grad_norm_(self.critic.parameters(), max_grad_norm_isaac)
                 
@@ -932,16 +913,10 @@ class PPO:
                             else:
                                 nn.init.constant_(param, 0.0)
                 else:
+                    # 🎯 已禁用动态障碍物：只检查 lidar_cnn
                     for name, param in self.lidar_cnn.named_parameters():
                         if torch.isnan(param).any() or torch.isinf(param).any():
                             print(f"[PPO] Critical: lidar_cnn.{name} weight contains NaN/inf after update, reinitializing...")
-                            if 'weight' in name:
-                                nn.init.orthogonal_(param, gain=0.01)
-                            else:
-                                nn.init.constant_(param, 0.0)
-                    for name, param in self.dyn_obs_mlp.named_parameters():
-                        if torch.isnan(param).any() or torch.isinf(param).any():
-                            print(f"[PPO] Critical: dyn_obs_mlp.{name} weight contains NaN/inf after update, reinitializing...")
                             if 'weight' in name:
                                 nn.init.orthogonal_(param, gain=0.01)
                             else:

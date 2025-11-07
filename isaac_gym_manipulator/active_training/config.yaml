@@ -22,7 +22,7 @@ env:
                                     # 例如: gpu_device_id: 1 表示使用GPU 1
   
   # Visualization settings
-  enable_viewer: false             # 启用 Isaac Gym 可视化窗口
+  enable_viewer: true             # 启用 Isaac Gym 可视化窗口
   camera_pos: [1.5, -1.5, 1.2]    # 视口相机位置 [x, y, z] - 从侧面/上方观看机械臂
   camera_target: [0.0, 0.0, 0.6]  # 视口相机目标 [x, y, z] - 看向机械臂中心略上方
   render_freq: 1                  # 渲染频率（每N步渲染一次，10=每10步渲染一次，降低频率以提高性能）
@@ -76,10 +76,10 @@ env:
   keepout_target_margin: 0.05     # 目标额外安全边界（和球半径、aruco_safe_radius叠加）
   
   # Dynamic obstacles (moving)
-  num_dynamic_obstacles: 3        # 动态障碍物数量（每个环境）
+  num_dynamic_obstacles: 0        # 动态障碍物数量（每个环境）- 已禁用
   dynamic_obstacle_radius_min: 0.08  # 动态障碍物半径范围
   dynamic_obstacle_radius_max: 0.15
-  dynamic_obstacle_vel_range: [0.05, 0.10]  # 速度范围（m/s）
+  dynamic_obstacle_vel_range: [10.0, 20.0]  # 速度范围（m/s）
   dynamic_obstacle_local_range: [0.4, 0.4, 0.3]  # 局部移动范围 [x, y, z]（相对于原点）
   dynamic_obstacle_goal_threshold: 0.2  # 到达目标的距离阈值（m）
   dynamic_obstacle_vel_update_interval: 2.0  # 速度更新间隔（秒）

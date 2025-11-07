@@ -27,6 +27,7 @@ except ImportError:
 
 
 class ArmNavEnv:
+
     """
     Isaac Gym 原生环境（不依赖 manipulator_env_gym）：
     - 加载 UR10e URDF
@@ -104,15 +105,15 @@ class ArmNavEnv:
         self.keepout_target_margin = 0.05
         self.obstacle_handles = []  # 每个环境的静态障碍物handle列表
         
-        # 动态障碍物参数（默认值，会被config覆盖）
+        # 动态障碍物参数（默认值，会被config覆盖，应与config.yaml保持一致）
         self.num_dynamic_obstacles = 0  # 动态障碍物数量（每个环境）
-        self.dynamic_obstacle_radius_min = 0.08
-        self.dynamic_obstacle_radius_max = 0.15
-        self.dynamic_obstacle_vel_range = [0.05, 0.15]  # 速度范围（m/s）
-        self.dynamic_obstacle_local_range = [0.4, 0.4, 0.3]  # 局部移动范围 [x, y, z]
-        self.dynamic_obstacle_goal_threshold = 0.2  # 到达目标的距离阈值（m）
-        self.dynamic_obstacle_vel_update_interval = 2.0  # 速度更新间隔（秒）
-        self.num_closest_dyn_obs = 3  # 检测最近的N个动态障碍物（参考isaac-training）
+        self.dynamic_obstacle_radius_min = 0.08  # 与config.yaml一致
+        self.dynamic_obstacle_radius_max = 0.15  # 与config.yaml一致
+        self.dynamic_obstacle_vel_range = [0.1, 0.2]  # 速度范围（m/s），与config.yaml一致
+        self.dynamic_obstacle_local_range = [0.4, 0.4, 0.3]  # 局部移动范围 [x, y, z]，与config.yaml一致
+        self.dynamic_obstacle_goal_threshold = 0.2  # 到达目标的距离阈值（m），与config.yaml一致
+        self.dynamic_obstacle_vel_update_interval = 2.0  # 速度更新间隔（秒），与config.yaml一致
+        self.num_closest_dyn_obs = 1  # 检测最近的N个动态障碍物，与config.yaml一致
         
         # 动态障碍物状态（将在创建后初始化）
         self.dynamic_obstacle_handles = []  # 动态障碍物handle列表
@@ -464,9 +465,25 @@ class ArmNavEnv:
         self.camera_handles = []
         self.wrist_body_handles = []
         
-        # 🎯 关键修复：当启用viewer时，不创建相机传感器，只用于可视化机械臂和障碍物
+        # 🎯 从配置读取相机参数
+        if cfg is not None and 'env' in cfg:
+            env_cfg = cfg['env']
+            self.aruco_camera_enabled = env_cfg.get('aruco_camera_enabled', True)  # 默认启用
+            self.aruco_render_freq = env_cfg.get('aruco_render_freq', 5)  # 默认每5步渲染一次
+        else:
+            self.aruco_camera_enabled = True
+            self.aruco_render_freq = 5
+        
+        # 🎯 关键修复：根据aruco_camera_enabled决定是否创建相机传感器
         # 这样可以避免 render_all_camera_sensors() 导致的段错误
-        if self.enable_viewer:
+        if not self.aruco_camera_enabled:
+            print(f"[Camera] aruco_camera_enabled=False，跳过相机传感器创建")
+            # 不创建相机传感器，设置handles为None
+            self.camera_handles = [None] * self.num_envs
+            self.camera_handle = None
+            self.wrist_body_handles = [None] * self.num_envs
+            self.wrist_body_handle = None
+        elif self.enable_viewer:
             print(f"[Camera] Viewer已启用，跳过相机传感器创建（仅用于可视化机械臂和障碍物）")
             # 不创建相机传感器，设置handles为None
             self.camera_handles = [None] * self.num_envs
@@ -529,11 +546,11 @@ class ArmNavEnv:
         # 计算每个环境的 actors 索引（参考manipulator_env_gym.py）
         # 多环境下，每个环境的actors顺序：robot (0), target (1), static_obstacles (2, 3, ...), dynamic_obstacles (...)
         # 每个环境的actors数量：1 (robot) + 1 (target) + num_obstacles (static) + num_dynamic_obstacles (dynamic)
-        actors_per_env = 2 + self.num_obstacles + self.num_dynamic_obstacles  # robot + target + static obstacles + dynamic obstacles
+        self.actors_per_env = 2 + self.num_obstacles + self.num_dynamic_obstacles  # robot + target + static obstacles + dynamic obstacles
         
         # 计算每个环境的robot和target在root_states中的索引
-        self.robot_root_indices = torch.arange(self.num_envs, device=self.device) * actors_per_env
-        self.target_root_indices = torch.arange(self.num_envs, device=self.device) * actors_per_env + 1
+        self.robot_root_indices = torch.arange(self.num_envs, device=self.device) * self.actors_per_env
+        self.target_root_indices = torch.arange(self.num_envs, device=self.device) * self.actors_per_env + 1
         
         # 计算 wrist 在 rigid_body_states 中的索引
         # 多环境下：rigid_body_states shape为 [num_envs * num_bodies, 13]
@@ -941,9 +958,32 @@ class ArmNavEnv:
         # 🎯 执行仿真步骤（参考ur5e模板的仿真循环）
         # 在ur5e模板中：每次循环执行 mj.mj_forward() 和 mj.mj_step()
         # 在Isaac Gym中：gym.simulate() 内部已经包含了前向动力学计算和仿真步骤
+        # 🎯 关键修复：在每个仿真子步骤中更新动态障碍物位置
+        # 这样可以确保障碍物位置不会被物理模拟重置
         for i in range(num_sim_steps):
+            # 🎯 在每个仿真步骤之前更新动态障碍物位置
+            if self.num_dynamic_obstacles > 0 and len(self.dynamic_obstacle_handles) > 0:
+                try:
+                    # 快速更新位置（不刷新，直接使用之前计算的位置）
+                    self._update_dynamic_obstacle_positions_to_sim_quick()
+                except Exception as e:
+                    # 如果快速更新失败，使用完整更新
+                    try:
+                        self._update_dynamic_obstacle_positions_to_sim()
+                    except:
+                        pass  # 如果更新失败，继续仿真
+            
             self.gym.simulate(self.sim)
             self.gym.fetch_results(self.sim, True)
+            
+            # 🎯 关键修复：在每个仿真步骤之后也更新动态障碍物位置
+            # 这样可以覆盖物理模拟可能重置的位置
+            if self.num_dynamic_obstacles > 0 and len(self.dynamic_obstacle_handles) > 0:
+                try:
+                    # 快速更新位置（覆盖物理模拟的结果）
+                    self._update_dynamic_obstacle_positions_to_sim_quick()
+                except:
+                    pass  # 如果更新失败，继续仿真
         
         # 🎯 刷新状态（确保获取最新的仿真结果）
         # 参考ur5e模板：每次仿真后需要读取最新状态
@@ -1193,8 +1233,8 @@ class ArmNavEnv:
         # 🎯 修复：为每个环境生成有效的目标位置（避开障碍物、基座、工作空间内）
         # 先刷新以获取最新状态
         self.gym.refresh_actor_root_state_tensor(self.sim)
-        actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
-        self.root_states = gymtorch.wrap_tensor(actor_root_state)
+        self.gym.refresh_actor_root_state_tensor(self.sim)
+
         
         # 🎯 先重置障碍物位置（在生成目标位置之前）
         self._spawn_or_reset_obstacles(reset_only=True)
@@ -1229,13 +1269,15 @@ class ArmNavEnv:
             self.target_pos[i] = target_pos
 
         # 应用所有更改（批量更新所有环境）
-        env_ids = torch.arange(self.num_envs, dtype=torch.int32, device='cpu')
-        self.gym.set_actor_root_state_tensor_indexed(
-            self.sim,
-            gymtorch.unwrap_tensor(self.root_states),
-            gymtorch.unwrap_tensor(env_ids),
-            len(env_ids)
-        )
+        # 🎯 使用统一的 _set_root_states_indexed 函数
+        target_indices_cpu = self.target_root_indices.to(device='cpu', dtype=torch.int64)
+        target_poses_cpu = torch.zeros((self.num_envs, 7), dtype=torch.float32, device='cpu')
+        for i in range(self.num_envs):
+            target_idx = self.target_root_indices[i].cpu().item()
+            if target_idx < self.root_states.shape[0]:
+                target_poses_cpu[i, 0:3] = self.root_states[target_idx, 0:3].cpu()
+                target_poses_cpu[i, 3:7] = self.root_states[target_idx, 3:7].cpu()
+        self._set_root_states_indexed(target_indices_cpu, target_poses_cpu, keep_vel=False)
 
         # 关节复位到 0（使用tensor方式，批量处理所有环境）
         for i in range(self.num_envs):
@@ -1730,115 +1772,88 @@ class ArmNavEnv:
         print(f"[LiDAR] 射线方向已预计算: {self.ray_directions.shape}, h_beams={self.lidar_hbeams}, v_beams={self.lidar_vbeams}")
     
     def _update_lidar(self):
-        """更新 LiDAR 扫描数据 - GPU 优化版本（参考manipulator_env_gym.py）"""
-        # 第一次调用时初始化射线方向
-        if self.ray_directions is None:
-            self._compute_ray_directions()
-        
-        # 获取末端执行器状态
-        ee_pos = self.ee_pos  # [num_envs, 3]
-        ee_quat = self.ee_quat  # [num_envs, 4]
-        
-        # 🎯 更新障碍物位置（从root_states读取）- 只检测静态障碍物（参考isaac-training）
-        # LiDAR只检测静态mesh，动态障碍物通过dyn_obs_state单独获取
-        actors_per_env = 2 + self.num_obstacles + self.num_dynamic_obstacles
-        obstacle_start_idx = 2  # robot(0) + target(1)
-        
-        if self.num_obstacles == 0:
-            # 没有静态障碍物，返回最大距离
-            self.lidar_scan = torch.full((self.num_envs, 1, self.lidar_hbeams, self.lidar_vbeams), self.lidar_range, device=self.device)
+        """GPU 并行版 LiDAR，使用统一 actor 布局，避免越界。"""
+        if not getattr(self, "use_lidar_input", True):
             return
         
-        # 生成所有静态障碍物索引（向量化）
-        # 🎯 修复：确保索引与root_states在同一设备上（root_states通常在CPU）
-        root_states_device = self.root_states.device
-        env_ids = torch.arange(self.num_envs, device=root_states_device).unsqueeze(1).expand(-1, self.num_obstacles).flatten()
-        obs_ids = torch.arange(self.num_obstacles, device=root_states_device).unsqueeze(0).expand(self.num_envs, -1).flatten()
-        obstacle_indices = env_ids * actors_per_env + obstacle_start_idx + obs_ids
+        # 首次初始化射线方向
+        if getattr(self, "ray_directions", None) is None:
+            self._compute_ray_directions()
         
-        # 批量提取静态障碍物位置和半径
-        all_obs_pos = self.root_states[obstacle_indices.long(), 0:3].to(self.device)
-        obstacle_positions = all_obs_pos.reshape(self.num_envs, self.num_obstacles, 3)  # [num_envs, num_obstacles, 3]
+        # ====== 第6步：修正 LiDAR 的静态障碍索引生成 ======
+        # 没有静态障碍就直接返回最大量程
+        if self.num_obstacles == 0:
+            self.lidar_scan = torch.full(
+                (self.num_envs, 1, self.lidar_hbeams, self.lidar_vbeams),
+                self.lidar_range, device=self.device, dtype=torch.float32
+            )
+            return
         
-        # 获取静态障碍物半径（从obstacle_radii）
-        # 🎯 修复：obstacle_radii存储的是所有环境的障碍物 [total_obstacles]
-        # 需要为每个环境提取对应的障碍物半径
-        if len(self.obstacle_radii) == self.num_envs * self.num_obstacles:
-            # obstacle_radii包含所有环境的障碍物，需要按环境提取
-            obstacle_radii_list = []
-            for env_idx in range(self.num_envs):
-                start_idx = env_idx * self.num_obstacles
-                end_idx = start_idx + self.num_obstacles
-                env_radii = self.obstacle_radii[start_idx:end_idx]  # [num_obstacles]
-                obstacle_radii_list.append(env_radii)
-            obstacle_radii = torch.stack(obstacle_radii_list, dim=0)  # [num_envs, num_obstacles]
-        elif len(self.obstacle_radii) == self.num_obstacles:
-            # obstacle_radii只包含单个环境的障碍物，扩展到所有环境
-            obstacle_radii = self.obstacle_radii.unsqueeze(0).expand(self.num_envs, -1)  # [num_envs, num_obstacles]
+        # 1) 射线方向（已初始化）
+        # 2) 生成静态障碍索引（与当前 actors_per_env 一致）
+        actors_per_env = getattr(self, "actors_per_env", 2 + self.num_obstacles + getattr(self, "num_dynamic_obstacles", 0))
+        obstacle_start_idx = 2                    # 静态从 2 开始
+        total_static = self.num_envs * self.num_obstacles
+        
+        # root_states 是 CPU 大张量
+        root_states_device = self.root_states.device if hasattr(self, "root_states") and self.root_states is not None else torch.device("cpu")
+        env_ids = torch.arange(self.num_envs, device=root_states_device).unsqueeze(1).expand(-1, self.num_obstacles).reshape(-1)
+        obs_ids = torch.arange(self.num_obstacles, device=root_states_device).unsqueeze(0).expand(self.num_envs, -1).reshape(-1)
+        obstacle_indices = env_ids * actors_per_env + obstacle_start_idx + obs_ids  # CPU long
+        obstacle_indices = obstacle_indices.to(dtype=torch.int32, device='cpu', non_blocking=True).contiguous()
+        
+        # 3) 读取静态障碍位置
+        self.gym.refresh_actor_root_state_tensor(self.sim)
+        # 🎯 修复：不要重新 acquire，只 refresh（避免破坏绑定）
+        if not hasattr(self, "root_states") or self.root_states is None:
+            raise RuntimeError("[LiDAR] root_states not initialized! Call _reacquire_root_tensor() first.")
+        
+        all_obs_pos = self.root_states[obstacle_indices.long(), 0:3]         # CPU
+        obstacle_positions = all_obs_pos.reshape(self.num_envs, self.num_obstacles, 3).to(self.device)
+        
+        # 4) 半径整理（与你当前的 self.obstacle_radii 组织方式匹配）
+        if hasattr(self, "obstacle_radii") and self.obstacle_radii is not None:
+            if len(self.obstacle_radii) == self.num_envs * self.num_obstacles:
+                obstacle_radii = self.obstacle_radii.reshape(self.num_envs, self.num_obstacles).to(self.device)
+            elif len(self.obstacle_radii) == self.num_obstacles:
+                obstacle_radii = self.obstacle_radii.to(self.device).unsqueeze(0).expand(self.num_envs, -1)
+            else:
+                print(f"[Warning] obstacle_radii unexpected len={len(self.obstacle_radii)}, fallback to 0.1")
+                obstacle_radii = torch.full((self.num_envs, self.num_obstacles), 0.1, device=self.device)
         else:
-            # 形状不匹配，使用默认值
-            print(f"[Warning] obstacle_radii shape mismatch: {len(self.obstacle_radii)} != {self.num_obstacles} or {self.num_envs * self.num_obstacles}")
-            obstacle_radii = torch.full((self.num_envs, self.num_obstacles), 0.1, device=self.device)  # 默认半径0.1米
+            obstacle_radii = torch.full((self.num_envs, self.num_obstacles), 0.1, device=self.device)
         
-        # 批量旋转所有射线方向（完全GPU并行）
-        num_rays = self.lidar_hbeams * self.lidar_vbeams
+        # 末端位姿
+        ee_pos = self.ee_pos   # [num_envs, 3]  (device)
+        ee_quat = self.ee_quat # [num_envs, 4]  (device)
         
-        # 预扩展射线方向 [h_beams, v_beams, 3] → [num_envs, h_beams, v_beams, 3]
-        ray_dirs_local = self.ray_directions.unsqueeze(0).expand(self.num_envs, -1, -1, -1)
+        # —— 批量旋转所有射线方向 —— 
+        hB, vB = self.lidar_hbeams, self.lidar_vbeams
+        num_rays = hB * vB
+        ray_dirs_local = self.ray_directions.unsqueeze(0).expand(self.num_envs, -1, -1, -1)              # [N, hB, vB, 3]
+        ray_dirs_flat  = ray_dirs_local.reshape(self.num_envs * num_rays, 3)                             # [N*num_rays, 3]
+        ee_quat_flat   = ee_quat.unsqueeze(1).expand(-1, num_rays, -1).reshape(self.num_envs * num_rays, 4)
+        ray_dirs_world_flat = quat_rotate_vector_batch(ee_quat_flat, ray_dirs_flat)                      # [N*num_rays, 3]
+        ray_dirs_world = ray_dirs_world_flat.reshape(self.num_envs, hB, vB, 3)
         
-        # Reshape为 [num_envs * num_rays, 3] 用于批量旋转
-        ray_dirs_local_flat = ray_dirs_local.reshape(self.num_envs * num_rays, 3)
+        # 5) 后续：射线旋转、相交计算、最小距离聚合
+        # —— 几何求交（射线-球）——
+        ee_pos_2d = ee_pos.unsqueeze(1).unsqueeze(1)                   # [N,1,1,3]
+        obs_pos_3d = obstacle_positions.unsqueeze(1).unsqueeze(1)      # [N,1,1,num_obstacles,3]
+        ray_dirs_4d = ray_dirs_world.unsqueeze(3)                      # [N,hB,vB,1,3]
+        oc = obs_pos_3d - ee_pos_2d.unsqueeze(3)                       # [N,hB,vB,num_obstacles,3]
+        proj = (ray_dirs_4d * oc).sum(dim=-1)                          # [N,hB,vB,num_obstacles]
+        oc2 = (oc ** 2).sum(dim=-1)                                    # [N,hB,vB,num_obstacles]
+        r = obstacle_radii.unsqueeze(1).unsqueeze(1)                   # [N,1,1,num_obstacles]
+        hit = (oc2 <= r**2) & (proj > 0)
+        disc = (r**2 - oc2).clamp(min=0.0)
+        hit_dist = torch.where(hit, proj - torch.sqrt(disc), torch.full_like(proj, self.lidar_range))
+        hit_dist = hit_dist.clamp(min=0.0, max=self.lidar_range)
+        min_dist = hit_dist.min(dim=-1)[0]                             # [N,hB,vB]
         
-        # 扩展四元数：[num_envs, 4] → [num_envs * num_rays, 4]
-        ee_quat_expanded = ee_quat.unsqueeze(1).expand(-1, num_rays, -1).reshape(self.num_envs * num_rays, 4)
-        
-        # 一次性旋转所有射线（完全并行）
-        ray_dirs_world_flat = quat_rotate_vector_batch(ee_quat_expanded, ray_dirs_local_flat)
-        
-        # Reshape回 [num_envs, h_beams, v_beams, 3]
-        ray_dirs_world = ray_dirs_world_flat.reshape(self.num_envs, self.lidar_hbeams, self.lidar_vbeams, 3)
-        
-        # GPU并行计算所有射线与障碍物的碰撞（射线-球体相交）
-        # 扩展维度用于广播
-        ee_pos_2d = ee_pos.unsqueeze(1).unsqueeze(1)  # [num_envs, 1, 1, 3]
-        obs_pos_3d = obstacle_positions.unsqueeze(1).unsqueeze(1)  # [num_envs, 1, 1, num_obstacles, 3]
-        ray_dirs_4d = ray_dirs_world.unsqueeze(3)  # [num_envs, h_beams, v_beams, 1, 3]
-        
-        # 向量: 射线原点到球心
-        oc = obs_pos_3d - ee_pos_2d.unsqueeze(3)  # [num_envs, h_beams, v_beams, num_obstacles, 3]
-        
-        # 射线方向与oc的点积（沿射线的投影）
-        ray_to_center_proj = (ray_dirs_4d * oc).sum(dim=-1)  # [num_envs, h_beams, v_beams, num_obstacles]
-        
-        # 计算射线到球心的最短距离的平方
-        oc_norm_sq = (oc ** 2).sum(dim=-1)  # [num_envs, h_beams, v_beams, num_obstacles]
-        closest_dist_sq = oc_norm_sq - ray_to_center_proj ** 2  # [num_envs, h_beams, v_beams, num_obstacles]
-        
-        # 障碍物半径（扩展维度）
-        obstacle_radius = obstacle_radii.unsqueeze(1).unsqueeze(1)  # [num_envs, 1, 1, num_obstacles]
-        
-        # 击中条件：最短距离小于半径，且投影为正（在射线前方）
-        hit_mask = (closest_dist_sq <= obstacle_radius ** 2) & (ray_to_center_proj > 0)
-        
-        # 计算精确的击中距离（使用射线-球体相交公式）
-        discriminant = obstacle_radius ** 2 - closest_dist_sq
-        hit_distances = torch.where(
-            hit_mask,
-            ray_to_center_proj - torch.sqrt(discriminant.clamp(min=0)),
-            torch.full_like(ray_to_center_proj, self.lidar_range)
-        )
-        
-        # 确保距离为正
-        hit_distances = hit_distances.clamp(min=0, max=self.lidar_range)
-        
-        # 对每条射线，取所有障碍物中的最小距离
-        min_distance = hit_distances.min(dim=-1)[0]  # [num_envs, h_beams, v_beams]
-        
-        # 存储 LiDAR 扫描数据（模仿无人机: range - distance）
-        self.lidar_scan = (self.lidar_range - min_distance).unsqueeze(1)  # [num_envs, 1, h_beams, v_beams]
-        
-        # 限制在 [0, lidar_range]
-        self.lidar_scan = torch.clamp(self.lidar_scan, 0, self.lidar_range)
+        # 存储（与上游保持一致的 range-minus 格式或直接距离，看你训练脚本）
+        self.lidar_scan = (self.lidar_range - min_dist).unsqueeze(1)   # [N,1,hB,vB]
+        self.lidar_scan = torch.clamp(self.lidar_scan, 0.0, self.lidar_range)
 
     def observe(self, voxel: Optional[torch.Tensor] = None, 
                 grid_origin: Optional[torch.Tensor] = None,
@@ -1936,71 +1951,12 @@ class ArmNavEnv:
             # 默认值
             lidar_obs = torch.zeros((self.num_envs, 1, self.lidar_hbeams, self.lidar_vbeams), device=self.device)
         
-        # 3. Dynamic Obstacle观测（参考无人机环境）
-        if self.num_dynamic_obstacles > 0 and self.dyn_obs_state is not None and self.dyn_obs_radii is not None:
-            # 计算每个环境最近的N个动态障碍物
-            dyn_obs_positions = self.dyn_obs_state[:, :3]  # [total_dyn_obs, 3]
-            dyn_obs_velocities = self.dyn_obs_state[:, 7:10] if self.dyn_obs_state.shape[1] >= 10 else torch.zeros((self.dyn_obs_state.shape[0], 3), device=self.device)  # [total_dyn_obs, 3]
-            
-            # 为每个环境计算最近的动态障碍物
-            dyn_obs_states_list = []
-            for env_idx in range(self.num_envs):
-                dyn_obs_start_idx = env_idx * self.num_dynamic_obstacles
-                dyn_obs_end_idx = (env_idx + 1) * self.num_dynamic_obstacles
-                
-                if dyn_obs_end_idx <= dyn_obs_positions.shape[0]:
-                    env_dyn_obs_pos = dyn_obs_positions[dyn_obs_start_idx:dyn_obs_end_idx]  # [num_dyn_obs, 3]
-                    env_dyn_obs_vel = dyn_obs_velocities[dyn_obs_start_idx:dyn_obs_end_idx]  # [num_dyn_obs, 3]
-                    env_dyn_obs_radii = self.dyn_obs_radii[dyn_obs_start_idx:dyn_obs_end_idx]  # [num_dyn_obs]
-                    
-                    # 计算相对位置
-                    dyn_obs_rpos = env_dyn_obs_pos - ee[env_idx:env_idx+1]  # [num_dyn_obs, 3]
-                    dyn_obs_distance = torch.norm(dyn_obs_rpos, dim=1)  # [num_dyn_obs]
-                    
-                    # 选择最近的N个
-                    num_closest = min(self.num_closest_dyn_obs, len(dyn_obs_distance))
-                    if num_closest > 0:
-                        _, closest_idx = torch.topk(dyn_obs_distance, num_closest, largest=False)
-                        closest_dyn_obs_rpos = dyn_obs_rpos[closest_idx]  # [num_closest, 3]
-                        closest_dyn_obs_vel = env_dyn_obs_vel[closest_idx]  # [num_closest, 3]
-                        closest_dyn_obs_distance = dyn_obs_distance[closest_idx]  # [num_closest]
-                        closest_dyn_obs_radii = env_dyn_obs_radii[closest_idx]  # [num_closest]
-                        
-                        # 归一化相对位置
-                        closest_dyn_obs_rpos_norm = closest_dyn_obs_rpos / closest_dyn_obs_distance.unsqueeze(1).clamp(min=1e-6)  # [num_closest, 3]
-                        
-                        # 拼接动态障碍物状态 [num_closest, 3+3+1+1=8]
-                        env_dyn_obs_state = torch.cat([
-                            closest_dyn_obs_rpos_norm,      # [num_closest, 3] 归一化相对位置
-                            closest_dyn_obs_vel,            # [num_closest, 3] 速度
-                            closest_dyn_obs_distance.unsqueeze(1),  # [num_closest, 1] 距离
-                            closest_dyn_obs_radii.unsqueeze(1)      # [num_closest, 1] 半径
-                        ], dim=1)  # [num_closest, 8]
-                        
-                        # 如果数量不足，用零填充
-                        if num_closest < self.num_closest_dyn_obs:
-                            padding = torch.zeros((self.num_closest_dyn_obs - num_closest, 8), device=self.device)
-                            env_dyn_obs_state = torch.cat([env_dyn_obs_state, padding], dim=0)
-                    else:
-                        env_dyn_obs_state = torch.zeros((self.num_closest_dyn_obs, 8), device=self.device)
-                else:
-                    env_dyn_obs_state = torch.zeros((self.num_closest_dyn_obs, 8), device=self.device)
-                
-                dyn_obs_states_list.append(env_dyn_obs_state)
-            
-            # 拼接所有环境的动态障碍物状态 [num_envs, num_closest, 8]
-            dyn_obs_states = torch.stack(dyn_obs_states_list, dim=0)  # [num_envs, num_closest, 8]
-            # 添加batch维度以匹配无人机格式 [num_envs, 1, num_closest, 8]
-            dyn_obs_states = dyn_obs_states.unsqueeze(1)
-        else:
-            # 默认值
-            dyn_obs_states = torch.zeros((self.num_envs, 1, self.num_closest_dyn_obs, 8), device=self.device)
-        
-        # 返回字典格式观测（参考无人机环境）
+        # 🎯 已禁用动态障碍物：不再计算动态障碍物观测
+        # 返回字典格式观测（只包含 state 和 lidar）
         obs = {
             "state": state_obs,           # [num_envs, 18] - 18维观测空间（包含ArUco检测状态）
             "lidar": lidar_obs,           # [num_envs, 1, h_beams, v_beams]
-            "dynamic_obstacle": dyn_obs_states  # [num_envs, 1, num_closest, 8]
+            # 🎯 已禁用动态障碍物：不再返回 dynamic_obstacle
         }
         
         return obs
@@ -2051,8 +2007,59 @@ class ArmNavEnv:
         
 
         self.progress += 1
+        
+        # 🎯 关键修复：在物理模拟之前更新动态障碍物逻辑位置和位置到仿真
+        # 这样可以在物理模拟之前就设置好位置，物理模拟会基于这个位置进行
+        if self.num_dynamic_obstacles > 0 and len(self.dynamic_obstacle_handles) > 0:
+            try:
+                # 先更新动态障碍物的逻辑位置（在 dyn_obs_state 中）
+                # 注意：这里需要 ee_pos，但 ee_pos 在 _read_wrist_pose() 中更新
+                # 所以我们需要先读取一次（如果还没有读取）
+                if not hasattr(self, 'ee_pos') or self.ee_pos is None:
+                    self.gym.refresh_rigid_body_state_tensor(self.sim)
+                    self._read_wrist_pose()
+                self._move_dynamic_obstacles()
+                
+                # 🎯 关键修复：在物理模拟之前更新位置到仿真
+                # 这样物理模拟会基于我们设置的位置进行，而不是 [0,0,0]
+                self._update_dynamic_obstacle_positions_to_sim()
+                # 🎯 标记动态障碍物已更新
+                self._dynamic_obstacles_updated = True
+            except Exception as e:
+                print(f"[Warning] Failed to move/update dynamic obstacles before simulation: {e}")
+        
         # 🎯 关键：执行仿真步骤，让PD控制器驱动机械臂移动到目标位置
         self._simulate_and_fetch()
+        
+        # 🎯 关键修复：在物理模拟之后，再次强制更新动态障碍物位置到仿真
+        # 因为物理模拟可能会改变位置，我们需要再次强制更新
+        if self.num_dynamic_obstacles > 0 and len(self.dynamic_obstacle_handles) > 0:
+            try:
+                # 🎯 先刷新状态，检查物理模拟后的位置
+                self.gym.refresh_actor_root_state_tensor(self.sim)
+                
+                # 🎯 调试：检查物理模拟后的位置（前几步）
+                debug_mode = hasattr(self, 'dyn_obs_step_count') and self.dyn_obs_step_count < 3
+                if debug_mode:
+                    self.actors_per_env = 2 + self.num_obstacles + self.num_dynamic_obstacles
+                    first_obs_idx = 0 * self.actors_per_env + 2 + self.num_obstacles + 0
+                    if first_obs_idx < self.root_states.shape[0]:
+                        pos_after_sim = self.root_states[first_obs_idx, :3].cpu().numpy()
+                        expected_pos = self.dyn_obs_state[0, :3].cpu().numpy()
+                        print(f"[Debug] After simulation, root_states[{first_obs_idx}] = [{pos_after_sim[0]:.3f}, {pos_after_sim[1]:.3f}, {pos_after_sim[2]:.3f}], expected=[{expected_pos[0]:.3f}, {expected_pos[1]:.3f}, {expected_pos[2]:.3f}]")
+                
+                # 强制更新位置到仿真（覆盖物理模拟的结果）
+                self._update_dynamic_obstacle_positions_to_sim()
+                
+                # 🎯 再次刷新，验证更新后的位置
+                self.gym.refresh_actor_root_state_tensor(self.sim)
+                if debug_mode:
+                    if first_obs_idx < self.root_states.shape[0]:
+                        pos_after_update = self.root_states[first_obs_idx, :3].cpu().numpy()
+                        print(f"[Debug] After update (post-sim), root_states[{first_obs_idx}] = [{pos_after_update[0]:.3f}, {pos_after_update[1]:.3f}, {pos_after_update[2]:.3f}], expected=[{expected_pos[0]:.3f}, {expected_pos[1]:.3f}, {expected_pos[2]:.3f}]")
+            except Exception as e:
+                print(f"[Warning] Failed to update dynamic obstacles after simulation: {e}")
+        
         # 更新末端位姿（在执行动作后）
         self.gym.refresh_rigid_body_state_tensor(self.sim)
         self._read_wrist_pose()
@@ -2068,20 +2075,6 @@ class ArmNavEnv:
                 self._update_lidar()
             except Exception as e:
                 print(f"[Warning] _update_lidar() failed in step(): {e}")
-        
-        # 更新动态障碍物位置（如果启用）
-        # 🎯 重要：在 _read_wrist_pose() 之后调用，确保 ee_pos 已更新
-        if self.num_dynamic_obstacles > 0 and len(self.dynamic_obstacle_handles) > 0:
-            try:
-                # 确保 ee_pos 已更新（在调用 _move_dynamic_obstacles 之前）
-                if hasattr(self, 'ee_pos') and self.ee_pos is not None:
-                    # ee_pos 应该已经在 _read_wrist_pose() 中更新
-                    pass
-                self._move_dynamic_obstacles()
-            except Exception as e:
-                print(f"[Warning] Failed to move dynamic obstacles in step(): {e}")
-                import traceback
-                traceback.print_exc()
         
         # 🎯 重要：在更新动态障碍物后，等待一小段时间让Isaac Gym稳定
         # 这可以避免段错误（通过执行一次小的仿真步骤来稳定状态）
@@ -3630,14 +3623,13 @@ class ArmNavEnv:
                 if reset_only and len(self.obstacle_handles) > env_idx * self.num_obstacles + i:
                     # 重置模式下：使用 root_state tensor 设置障碍物位置
                     # 障碍物索引计算：每个环境有 robot(0) + target(1) + static_obstacles(num_obstacles) + dynamic_obstacles(num_dynamic_obstacles)
-                    # 全局索引 = env_idx * actors_per_env + 2 + i
-                    actors_per_env = 2 + self.num_obstacles + self.num_dynamic_obstacles  # robot + target + static + dynamic
-                    obs_root_idx = env_idx * actors_per_env + 2 + i
+                    # 全局索引 = env_idx * self.actors_per_env + 2 + i
+                    self.actors_per_env = 2 + self.num_obstacles + self.num_dynamic_obstacles  # robot + target + static + dynamic
+                    obs_root_idx = env_idx * self.actors_per_env + 2 + i
                     
-                    # 刷新以获取最新状态
+                    # ✅ 1) 绝对不要在 init 之后重新 acquire + wrap root_states
+                    # 只刷新，不重绑
                     self.gym.refresh_actor_root_state_tensor(self.sim)
-                    actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
-                    self.root_states = gymtorch.wrap_tensor(actor_root_state)
                     
                     if obs_root_idx < self.root_states.shape[0]:
                         new_root_state = self.root_states[obs_root_idx].clone()
@@ -3647,13 +3639,12 @@ class ArmNavEnv:
                         self.root_states[obs_root_idx] = new_root_state
                         
                         # 批量更新所有环境（简化：只更新当前环境）
-                        env_ids = torch.tensor([env_idx], dtype=torch.int32, device='cpu')
-                        self.gym.set_actor_root_state_tensor_indexed(
-                            self.sim,
-                            gymtorch.unwrap_tensor(self.root_states),
-                            gymtorch.unwrap_tensor(env_ids),
-                            len(env_ids)
-                        )
+                        # 🎯 使用统一的 _set_root_states_indexed 函数
+                        actor_idx_cpu = torch.tensor([obs_root_idx], dtype=torch.int64, device='cpu')
+                        pose_cpu = torch.zeros((1, 7), dtype=torch.float32, device='cpu')
+                        pose_cpu[0, 0:3] = new_root_state[0:3].cpu()
+                        pose_cpu[0, 3:7] = new_root_state[3:7].cpu()
+                        self._set_root_states_indexed(actor_idx_cpu, pose_cpu, keep_vel=False)
                     
                     # 更新存储的半径和位置
                     handle_idx = env_idx * self.num_obstacles + i
@@ -3677,9 +3668,167 @@ class ArmNavEnv:
         
         # 更新障碍物位置和半径信息
         self._update_obstacle_positions()
+        
+        # ====== 第3步：静态障碍的初始落地（批量初始化）======
+        # 布局（此时 dynamic 还没创建时）
+        self.actors_per_env = 2 + self.num_obstacles  # robot(1) + target(1) + static
+        print(f"[Layout] per-env: robot=1, target=1, static={self.num_obstacles}, dynamic=0, self.actors_per_env = {self.actors_per_env}")
+        
+        # 重新获取一次完整 root tensor
+        self._reacquire_root_tensor()
+        
+        # ====== 批量落地静态障碍 root state ======
+        if not reset_only and len(self.obstacle_handles) > 0:
+            robot_offset   = 0
+            target_offset  = 1
+            static_offset  = 2
+            all_indices = []
+            all_states  = []
+            
+            for env_id in range(self.num_envs):
+                base = env_id * self.actors_per_env
+                for j in range(self.num_obstacles):
+                    root_idx = base + static_offset + j
+                    all_indices.append(root_idx)
+                    
+                    # 依据已有的静态障碍位姿数组
+                    handle_idx = env_id * self.num_obstacles + j
+                    if handle_idx < len(self.obstacle_positions_np):
+                        pos = self.obstacle_positions_np[handle_idx]
+                        px, py, pz = pos[0], pos[1], pos[2]
+                    else:
+                        # 兜底：使用默认位置
+                        px, py, pz = 0.0, 0.0, 0.5
+                    
+                    state = torch.zeros(13, dtype=torch.float32)
+                    state[0:3] = torch.tensor([px, py, pz], dtype=torch.float32)
+                    state[3:7] = torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=torch.float32)  # 单位四元数
+                    # 线速度/角速度全 0
+                    all_states.append(state)
+            
+            if len(all_indices) > 0:
+                idx = torch.tensor(all_indices, dtype=torch.int64)
+                ns  = torch.stack(all_states, dim=0)  # (num_envs*num_obstacles, 13)
+                ok = self._apply_root_states_indexed(idx, ns)
+                if not ok:
+                    print("[StaticInit] Failed to apply indexed root states for static obstacles.")
+        
+        # 🎯 关键修复：静态障碍物创建后，重新计算 actor 布局
+        self._recompute_actor_layout()
     
+    def _recompute_actor_layout(self):
+        """
+        统一定义每个环境内的 actor 顺序与数量，保证所有后续索引按相同布局计算。
+        
+        布局（每个 env）：
+          0: robot
+          1: target (ArUco)
+          [2, ..., 2+S-1]: 静态障碍物 S = self.num_static_obstacles
+          [2+S, ..., 2+S+D-1]: 动态障碍物 D = self.num_dynamic_obstacles
+        """
+        # 真实的静态障碍数：优先按 handle 数判断，其次按配置
+        if hasattr(self, "obstacle_handles") and isinstance(self.obstacle_handles, list) and len(self.obstacle_handles) > 0:
+            # 允许两种形态：
+            #  - 扁平：长度 = num_envs * S
+            #  - 分 env 的 list[list]：长度 = num_envs，每个子表长度 = S
+            if len(self.obstacle_handles) == self.num_envs and isinstance(self.obstacle_handles[0], list):
+                self.num_static_obstacles = len(self.obstacle_handles[0])
+            else:
+                # 扁平
+                self.num_static_obstacles = (len(self.obstacle_handles) // max(1, self.num_envs))
+        else:
+            # 兜底（与配置保持一致）
+            self.num_static_obstacles = getattr(self, "num_obstacles", 0)
+        
+        # 动态障碍（每 env）
+        self.num_dynamic_obstacles = int(getattr(self, "num_dynamic_obstacles", 0))
+        
+        # 统一布局
+        self.actors_per_env = 2 + self.num_static_obstacles + self.num_dynamic_obstacles
+        self.static_start = 2
+        self.dynamic_start = 2 + self.num_static_obstacles
+        
+        # 生成各类 root 索引（CPU int64）
+        device_cpu = torch.device("cpu")
+        env_ids = torch.arange(self.num_envs, device=device_cpu, dtype=torch.int64)
+        base = env_ids * self.actors_per_env
+        
+        self.robot_root_indices = base.clone()                                  # [num_envs]
+        self.target_root_indices = base + 1                                     # [num_envs]
+        
+        if self.num_static_obstacles > 0:
+            off = torch.arange(self.num_static_obstacles, device=device_cpu, dtype=torch.int64)
+            self.static_root_indices = (base.view(-1, 1) + (self.static_start + off).view(1, -1)).reshape(-1)
+        else:
+            self.static_root_indices = torch.empty(0, dtype=torch.int64, device=device_cpu)
+        
+        if self.num_dynamic_obstacles > 0:
+            off = torch.arange(self.num_dynamic_obstacles, device=device_cpu, dtype=torch.int64)
+            self.dynamic_root_indices = (base.view(-1, 1) + (self.dynamic_start + off).view(1, -1)).reshape(-1)
+        else:
+            self.dynamic_root_indices = torch.empty(0, dtype=torch.int64, device=device_cpu)
+        
+        # 供调试
+        print(f"[Layout] per-env: robot=1, target=1, static={self.num_static_obstacles}, dynamic={self.num_dynamic_obstacles}, self.actors_per_env = {self.actors_per_env}")
+    
+    def _set_root_states_indexed(self, indices_cpu: torch.Tensor, new_poses_world_cpu: torch.Tensor, keep_vel=False):
+        """
+        用于批量更新一组 actor 的根状态（位置+朝向），确保形状严格匹配。
+        
+        参数:
+          indices_cpu: [N] (int64, CPU) — 目标 actor root 索引
+          new_poses_world_cpu: [N, 7] (float32, CPU) — 位置(x,y,z)+四元数(x,y,z,w)
+          keep_vel: 是否保留当前速度（默认 False -> 置零）
+        """
+        assert indices_cpu.device.type == "cpu" and indices_cpu.dtype in (torch.int64, torch.long)
+        assert new_poses_world_cpu.device.type == "cpu" and new_poses_world_cpu.shape[0] == indices_cpu.shape[0]
+        
+        N = indices_cpu.shape[0]
+        if N == 0:
+            return
+        
+        # 🎯 关键修复：使用 _apply_root_states_indexed 统一处理
+        # 准备新状态（N, 13）
+        new_states = torch.zeros((N, 13), dtype=torch.float32, device="cpu")
+        new_states[:, 0:3] = new_poses_world_cpu[:, 0:3]     # pos
+        new_states[:, 3:7] = new_poses_world_cpu[:, 3:7]     # quat (x,y,z,w)
+        
+        if keep_vel:
+            # 复制当前速度
+            self.gym.refresh_actor_root_state_tensor(self.sim)
+            # 🎯 修复：不要重新 acquire，只 refresh（避免破坏绑定）
+            if not hasattr(self, "root_states") or self.root_states is None:
+                raise RuntimeError("[RootState] root_states not initialized! Call _reacquire_root_tensor() first.")
+            cur_cpu = self.root_states.detach().cpu()
+            new_states[:, 7:13] = cur_cpu[indices_cpu, 7:13]
+        else:
+            # 速度清零
+            new_states[:, 7:13] = 0.0
+        
+        # 使用统一的 helper 函数
+        if not self._apply_root_states_indexed(indices_cpu, new_states):
+            print(f"[RootState] Failed to apply indexed root states for {N} actors")
+    
+    def _reacquire_root_tensor(self):
+        """在创建完一批 actor（静态/动态）之后立即调用，保证拿到完整 (num_actors, 13) root tensor。"""
+        _root = self.gym.acquire_actor_root_state_tensor(self.sim)
+        self.root_states = gymtorch.wrap_tensor(_root)
+
+        # 🎯 关键修复：不要重新赋值 self.root_states，这会破坏与 Isaac Gym 的绑定！
+        # Isaac Gym 返回的 tensor 应该已经是正确的格式
+        # 如果格式不对，说明初始化有问题，这里只检查并警告
+        if self.root_states.device.type != "cpu":
+            print(f"[RootTensor] WARNING: root_states is on {self.root_states.device}, expected CPU")
+        if self.root_states.dtype != torch.float32:
+            print(f"[RootTensor] WARNING: root_states dtype is {self.root_states.dtype}, expected float32")
+        if not self.root_states.is_contiguous():
+            print(f"[RootTensor] WARNING: root_states is not contiguous")
+
+        print(f"[RootTensor] Re-acquired: shape={tuple(self.root_states.shape)}")
+
+
     def _spawn_dynamic_obstacles(self):
-        """创建动态障碍物（球体，每个环境独立）"""
+        """创建动态障碍物 - 修复为动态物体"""
         if self.num_dynamic_obstacles == 0:
             return
         
@@ -3694,26 +3843,33 @@ class ArmNavEnv:
         self.dyn_obs_radii = torch.zeros((total_dyn_obs,), device=self.device)
         self.dyn_obs_step_count = 0
         
-        # 🎯 修复：立即初始化速度，而不是等待第一次更新（避免障碍物不动）
+        # 初始速度
         initial_vel = (self.dynamic_obstacle_vel_range[0] + self.dynamic_obstacle_vel_range[1]) / 2.0
         self.dyn_obs_vel_norm = torch.full((total_dyn_obs, 1), initial_vel, device=self.device)
-        # 为每个障碍物生成随机方向的初始速度（确保创建时就有速度）
         random_direction = torch.randn(total_dyn_obs, 3, device=self.device)
         random_direction = random_direction / (torch.norm(random_direction, dim=1, keepdim=True) + 1e-6)
         self.dyn_obs_vel = self.dyn_obs_vel_norm * random_direction
         
-        # 为每个环境创建动态障碍物
+        # 🎯 关键修复：确保动态障碍物是动态物体
         for env_idx in range(self.num_envs):
             env = self.envs[env_idx]
             
             for dyn_idx in range(self.num_dynamic_obstacles):
-                # 随机生成半径
                 radius = np.random.uniform(
                     self.dynamic_obstacle_radius_min,
                     self.dynamic_obstacle_radius_max
                 )
                 
-                # 在工作空间内随机生成初始位置
+                # 🎯 修复1：创建动态障碍物资产
+                asset_options = gymapi.AssetOptions()
+                asset_options.density = 100.0  # 设置密度
+                asset_options.disable_gravity = True  # 禁用重力，避免下落
+                # 🎯 关键：确保是动态物体
+                asset_options.fix_base_link = False  # 不固定基座
+                
+                sphere_asset = self.gym.create_sphere(self.sim, radius, asset_options)
+                
+                # 生成位置（保持原有逻辑）
                 for _ in range(100):
                     rho = np.random.uniform(0.3, self.workspace_radius * 0.8)
                     theta = np.random.uniform(-np.pi, np.pi)
@@ -3725,14 +3881,12 @@ class ArmNavEnv:
                     )
                     pos = np.array([x, y, z], dtype=np.float32)
                     
-                    # 检查是否与基座和静态障碍物冲突
                     if np.linalg.norm(pos[:2]) < self.keepout_base_radius:
                         continue
                     
-                    # 检查与静态障碍物的距离
                     min_dist = 10.0
                     for static_idx in range(env_idx * self.num_obstacles, 
-                                           (env_idx + 1) * self.num_obstacles):
+                                        (env_idx + 1) * self.num_obstacles):
                         if static_idx < len(self.obstacle_positions_np):
                             static_pos = self.obstacle_positions_np[static_idx]
                             dist = np.linalg.norm(pos - static_pos)
@@ -3742,23 +3896,36 @@ class ArmNavEnv:
                                 static_rad = (self.sphere_radius_min + self.sphere_radius_max) / 2.0
                             min_dist = min(min_dist, dist - static_rad - radius)
                     
-                    if min_dist > 0.15:  # 至少15cm间距
+                    if min_dist > 0.15:
                         break
                 
-                # 创建动态障碍物（球体，使用红色以区分静态障碍物）
-                sphere_asset = self.gym.create_sphere(self.sim, radius, gymapi.AssetOptions())
+                # 创建动态障碍物
                 T = gymapi.Transform()
                 T.p = gymapi.Vec3(pos[0], pos[1], pos[2])
                 T.r = gymapi.Quat(0, 0, 0, 1)
                 
+                # 🎯 修复2：创建为动态actor
                 handle = self.gym.create_actor(
                     env, sphere_asset, T, 
                     f"dyn_obs_{env_idx}_{dyn_idx}", 
-                    0, 0
+                    0,  # 碰撞组
+                    0   # 碰撞过滤
                 )
+                
+                # 🎯 修复3：将障碍物设置为动态（mass > 0）
+                # 注意：静态物体（mass=0）无法通过 set_actor_root_state_tensor_indexed 更新位置
+                # 所以我们需要使用动态物体，但在物理模拟后立即强制更新位置
+                # Isaac Gym 的 RigidBodyProperties 只支持 mass 属性，不支持 damping
+                # 阻尼需要在 asset 创建时通过 AssetOptions 设置
+                rigid_props = self.gym.get_actor_rigid_body_properties(env, handle)
+                if len(rigid_props) > 0:
+                    # 设置为动态（mass > 0），这样才能通过 set_actor_root_state_tensor_indexed 更新
+                    rigid_props[0].mass = 1.0
+                    self.gym.set_actor_rigid_body_properties(env, handle, rigid_props)
+                
                 self.dynamic_obstacle_handles.append(handle)
                 
-                # 设置动态障碍物颜色为红色（与静态蓝色区分）
+                # 设置颜色为红色
                 self.gym.set_rigid_body_color(
                     env, handle, 0,
                     gymapi.MESH_VISUAL,
@@ -3770,14 +3937,13 @@ class ArmNavEnv:
                 self.dyn_obs_state[global_idx, :3] = torch.tensor(pos, device=self.device)
                 self.dyn_obs_origin[global_idx] = torch.tensor(pos, device=self.device)
                 
-                # 🎯 生成初始目标（在局部范围内随机）
+                # 生成初始目标
                 goal_offset = torch.tensor([
                     np.random.uniform(-self.dynamic_obstacle_local_range[0], self.dynamic_obstacle_local_range[0]),
                     np.random.uniform(-self.dynamic_obstacle_local_range[1], self.dynamic_obstacle_local_range[1]),
                     np.random.uniform(-self.dynamic_obstacle_local_range[2], self.dynamic_obstacle_local_range[2])
                 ], device=self.device)
                 initial_goal = self.dyn_obs_origin[global_idx] + goal_offset
-                # 限制在工作空间内
                 initial_goal[0] = torch.clamp(initial_goal[0], -self.workspace_radius * 0.8, self.workspace_radius * 0.8)
                 initial_goal[1] = torch.clamp(initial_goal[1], -self.workspace_radius * 0.8, self.workspace_radius * 0.8)
                 initial_goal[2] = torch.clamp(initial_goal[2], self.workspace_z[0] + 0.1, self.workspace_z[1] - 0.1)
@@ -3785,21 +3951,126 @@ class ArmNavEnv:
                 
                 self.dyn_obs_radii[global_idx] = radius
         
-        # 🎯 关键：创建完所有actor后，必须先刷新root_states才能获取正确的索引
-        # 刷新一次以确保root_states包含所有新创建的动态障碍物
-        self.gym.refresh_actor_root_state_tensor(self.sim)
-        actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
-        self.root_states = gymtorch.wrap_tensor(actor_root_state)
+        # 🎯 关键修复：在所有障碍物创建完成后，重新获取 root tensor（因为 actor 数量变了）
+        # 这是唯一允许重新 acquire 的地方（创建完 actor 后）
+        self._reacquire_root_tensor()
         
-        # 🎯 重要：创建后立即更新一次位置到仿真（确保可视化正确）
         if len(self.dynamic_obstacle_handles) > 0:
             try:
-                self._update_dynamic_obstacle_positions_to_sim()
+                # ====== 第5步：动态障碍物初始位置批量设置 ======
+                # 计算每个环境的 actors 数量
+                self.actors_per_env = 2 + self.num_obstacles + self.num_dynamic_obstacles
+                
+                # 批量准备所有动态障碍物的初始状态
+                # 🎯 使用 get_actor_index 获取真实索引（不手算）
+                all_dyn_indices = []
+                all_dyn_states = []
+                
+                for i, handle in enumerate(self.dynamic_obstacle_handles):
+                    env_idx = i // self.num_dynamic_obstacles
+                    global_idx = i
+                    
+                    if global_idx < self.dyn_obs_state.shape[0]:
+                        # 🎯 使用 get_actor_index 获取真实的全局 SIM 索引
+                        sim_id = self.gym.get_actor_index(self.envs[env_idx], handle, gymapi.DOMAIN_SIM)
+                        obs_root_idx = int(sim_id)
+                        
+                        if obs_root_idx < self.root_states.shape[0]:
+                            all_dyn_indices.append(obs_root_idx)
+                            
+                            # 准备初始状态
+                            new_state = torch.zeros(13, dtype=torch.float32, device='cpu')
+                            new_state[0:3] = self.dyn_obs_state[global_idx, :3].cpu()
+                            new_state[3:7] = torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=torch.float32, device='cpu')
+                            new_state[7:13] = 0.0  # 初始速度为0
+                            all_dyn_states.append(new_state)
+                
+                # 🎯 批量更新所有动态障碍物的初始位置
+                if len(all_dyn_indices) > 0:
+                    idx_tensor = torch.tensor(all_dyn_indices, dtype=torch.int64, device='cpu')
+                    states_tensor = torch.stack(all_dyn_states, dim=0)  # (num_dyn, 13)
+                    ok = self._apply_root_states_indexed(idx_tensor, states_tensor)
+                    if not ok:
+                        print("[DynamicInit] Failed to apply indexed root states for dynamic obstacles.")
+                
+                # 🎯 刷新并验证初始位置
+                self.gym.refresh_actor_root_state_tensor(self.sim)
+                
+                # 验证前几个障碍物的位置（使用缓存的索引）
+                if hasattr(self, 'dyn_root_indices') and self.dyn_root_indices.numel() > 0:
+                    for i in range(min(2, len(self.dynamic_obstacle_handles), self.dyn_root_indices.numel())):
+                        obs_root_idx = int(self.dyn_root_indices[i].item())
+                        if obs_root_idx < self.root_states.shape[0]:
+                            actual_pos = self.root_states[obs_root_idx, :3].cpu().numpy()
+                            expected_pos = self.dyn_obs_state[i, :3].cpu().numpy()
+                            diff = np.linalg.norm(actual_pos - expected_pos)
+                            if diff > 0.01:
+                                print(f"[Warning] Failed to set initial position for obstacle {i}: expected={expected_pos}, actual={actual_pos}, diff={diff:.6f}m")
+                            else:
+                                print(f"[Debug] Successfully set initial position for obstacle {i}: {actual_pos}")
+                
+                print(f"[Dynamic Obstacles] ✅ 成功创建 {len(self.dynamic_obstacle_handles)} 个动态障碍物")
+                
+                # 🎯 调试：验证障碍物类型
+                for i, handle in enumerate(self.dynamic_obstacle_handles[:2]):  # 检查前2个
+                    env_idx = i // self.num_dynamic_obstacles
+                    env = self.envs[env_idx]
+                    rigid_props = self.gym.get_actor_rigid_body_properties(env, handle)
+                    if len(rigid_props) > 0:
+                        mass = rigid_props[0].mass
+                        print(f"[Debug] Dynamic obstacle {i} mass: {mass}")
+                        
             except Exception as e:
                 print(f"[Warning] Failed to update dynamic obstacle positions during spawn: {e}")
                 import traceback
                 traceback.print_exc()
-    
+                
+        # ====== 第4步：动态障碍创建之后，更新布局 + 重新获取 root tensor ======
+        self.actors_per_env = 2 + self.num_obstacles + self.num_dynamic_obstacles
+        self._reacquire_root_tensor()
+        print(f"[Layout] per-env: robot=1, target=1, static={self.num_obstacles}, dynamic={self.num_dynamic_obstacles}, self.actors_per_env = {self.actors_per_env}")
+        
+        # 🎯 关键修复：动态障碍物创建后，重新计算 actor 布局
+        self._recompute_actor_layout()
+        
+        # 🎯 关键修复：使用 get_actor_index 获取真实 SIM 索引（不手算）
+        if len(self.dynamic_obstacle_handles) > 0:
+            all_dyn_indices = []
+            for i, handle in enumerate(self.dynamic_obstacle_handles):
+                env_idx = i // self.num_dynamic_obstacles
+                # 🎯 使用 get_actor_index 获取真实的全局 SIM 索引
+                sim_id = self.gym.get_actor_index(self.envs[env_idx], handle, gymapi.DOMAIN_SIM)
+                all_dyn_indices.append(int(sim_id))
+            self.dyn_root_indices = torch.tensor(all_dyn_indices, dtype=torch.int32, device='cpu').contiguous()
+            print(f"[Debug] Cached {self.dyn_root_indices.numel()} dynamic obstacle root indices (via get_actor_index): {self.dyn_root_indices.tolist()}")
+                
+    def test_dynamic_obstacles_visibility(self):
+        """测试动态障碍物是否可见和移动"""
+        print("=== Testing Dynamic Obstacles Visibility ===")
+        
+        # 设置一个障碍物到明显位置
+        test_pos = torch.tensor([1.0, 0.0, 0.8], device=self.device)
+        self.dyn_obs_state[0, :3] = test_pos
+        
+        # 更新到仿真
+        self._update_dynamic_obstacle_positions_to_sim()
+        
+        print("请检查可视化窗口：")
+        print("1. 是否能看到红色的动态障碍物球体？")
+        print("2. 位置是否在 [1.0, 0.0, 0.8] 附近？")
+        
+        # 测试移动
+        for i in range(5):
+            # 移动障碍物
+            self.dyn_obs_state[0, 0] -= 0.2  # 向左移动
+            self._update_dynamic_obstacle_positions_to_sim()
+            
+            print(f"移动测试 {i+1}: 障碍物位置 x={self.dyn_obs_state[0, 0].item():.2f}")
+            
+            # 等待一下，让用户看到变化
+            import time
+            time.sleep(1.0)
+
     def _update_obstacle_positions(self):
         """
         更新障碍物位置和半径信息（用于距离计算）
@@ -4187,43 +4458,11 @@ class ArmNavEnv:
                 self.workspace_z[1] - 0.05
             )
             
-            # Step 4: 更新仿真中的可视化位置
-            # 🎯 关键修复：防止竞争条件 - 在更新动态障碍物位置时，必须确保图形状态同步
-            # 使用标志来标记动态障碍物已更新，避免在渲染时使用过时的状态
-            try:
-                # 🎯 关键修复：在开始处添加更严格的GPU同步
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()  # 确保所有之前的操作完成
-                
-                # 🎯 关键修复：在更新仿真位置前再次同步
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                
-                self._update_dynamic_obstacle_positions_to_sim()
-                
-                # 🎯 关键修复：更新后同步，确保状态已写入
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                
-                # 🎯 关键修复：标记动态障碍物已更新（用于检测竞争条件）
-                self._dynamic_obstacles_updated = True
-                
-                # 🎯 关键修复：当启用viewer时，更新动态障碍物位置后需要重新调用step_graphics()
-                # 因为set_actor_root_state_tensor_indexed()会修改图形状态，需要更新图形流水线
-                # 🚨 重要：不要在动态障碍物更新后立即调用step_graphics()，因为这可能导致竞争条件
-                # 应该在render_depth()之前调用step_graphics()，而不是在这里
-                # 注释掉这里的step_graphics()调用，避免竞争条件
-                # if self.enable_viewer and self.viewer is not None:
-                #     try:
-                #         # 更新图形状态，确保viewer和相机传感器能看到最新的障碍物位置
-                #         self.gym.step_graphics(self.sim)
-                #     except Exception as e:
-                #         print(f"[Warning] step_graphics() after dynamic obstacle update failed: {e}")
-                #         # 继续，可能图形状态已经更新
-            except Exception as e:
-                print(f"[Warning] Failed to update dynamic obstacle positions to sim: {e}")
-                import traceback
-                traceback.print_exc()
+            # Step 4: 只更新逻辑位置，不更新到仿真
+            # 🎯 关键修复：移除这里的 _update_dynamic_obstacle_positions_to_sim() 调用
+            # 因为 step() 中会在物理模拟后统一更新位置，避免重复调用
+            # 位置更新将在 step() 中的物理模拟后统一进行
+            # 注意：不再需要 try-except，因为这里不再调用更新函数
             
             self.dyn_obs_step_count += 1
             
@@ -4237,39 +4476,17 @@ class ArmNavEnv:
                 torch.cuda.empty_cache()
             # 即使出错也继续，避免完全停止训练
 
-    def _update_dynamic_obstacle_positions_to_sim(self):
-        """将动态障碍物位置更新到仿真（辅助函数，避免重复代码）"""
+    def _update_dynamic_obstacle_positions_to_sim_quick(self):
+        """快速更新动态障碍物位置（用于仿真子步骤中，不刷新状态）"""
         if self.num_dynamic_obstacles == 0 or self.dyn_obs_state is None or len(self.dynamic_obstacle_handles) == 0:
             return
         
-        # 🎯 关键修复：不要重新 acquire 和包装 root_states！这会覆盖现有的 tensor 并可能导致段错误
-        # root_states 已经在 __init__ 中创建并包装
-        # 🎯 重要：不要在更新前刷新 root_states！因为在 step() 中已经刷新过了
-        # 如果在这里刷新，然后立即修改，可能导致状态不一致
-        # 验证root_states的形状
-        if self.root_states is None or len(self.root_states.shape) != 2:
-            print(f"[Error] Invalid root_states shape: {self.root_states.shape if self.root_states is not None else None}")
-            return
-        
-        # 计算每个动态障碍物在root_states中的索引
-        # 每个环境的actors: robot(0) + target(1) + static_obstacles(num_obstacles) + dynamic_obstacles(num_dynamic_obstacles)
-        actors_per_env = 2 + self.num_obstacles + self.num_dynamic_obstacles
-        
-        # 🎯 添加边界检查：验证root_states大小是否匹配预期
-        total_expected_actors = self.num_envs * actors_per_env
-        if self.root_states.shape[0] < total_expected_actors:
-            print(f"[Error] root_states size mismatch: expected {total_expected_actors}, got {self.root_states.shape[0]}")
-            print(f"[Error] num_envs={self.num_envs}, actors_per_env={actors_per_env}, num_obstacles={self.num_obstacles}, num_dynamic_obstacles={self.num_dynamic_obstacles}")
-            return
-        
-        # 🎯 关键修复：创建一个新的状态 tensor，而不是直接修改 root_states
-        # 这可以避免内存不一致导致的段错误
+        # 🎯 快速更新：直接使用之前计算的 dyn_obs_state，不刷新 root_states
+        # 这样可以避免在每个子步骤中都刷新状态，提高效率
         try:
-            # 构建动态障碍物的actor索引列表和对应的新状态
-            actors_per_env = 2 + self.num_obstacles + self.num_dynamic_obstacles
-            dyn_obs_indices = []
-            dyn_obs_new_states = []
+            self.actors_per_env = 2 + self.num_obstacles + self.num_dynamic_obstacles
             
+            # 直接修改 root_states（假设它已经被正确初始化）
             for i in range(len(self.dynamic_obstacle_handles)):
                 env_idx = i // self.num_dynamic_obstacles
                 dyn_idx = i % self.num_dynamic_obstacles
@@ -4277,96 +4494,188 @@ class ArmNavEnv:
                 if env_idx >= self.num_envs or i >= self.dyn_obs_state.shape[0]:
                     continue
                 
-                # 计算在root_states中的全局索引
-                obs_root_idx = env_idx * actors_per_env + 2 + self.num_obstacles + dyn_idx
+                obs_root_idx = env_idx * self.actors_per_env + 2 + self.num_obstacles + dyn_idx
                 if obs_root_idx >= self.root_states.shape[0]:
                     continue
                 
-                # 验证位置是否有效
-                new_pos = self.dyn_obs_state[i, :3]
-                if torch.isnan(new_pos).any() or torch.isinf(new_pos).any():
-                    continue
-                
-                # 创建新的状态（13维：pos[3] + quat[4] + lin_vel[3] + ang_vel[3]）
+                # 创建新状态
                 new_state = torch.zeros(13, dtype=torch.float32, device=self.device)
-                new_state[0:3] = new_pos
-                new_state[3:7] = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device, dtype=torch.float32)  # 固定四元数
-                new_state[7:13] = 0.0  # 零速度
+                new_state[0:3] = self.dyn_obs_state[i, :3]
+                new_state[3:7] = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device, dtype=torch.float32)
+                if self.dyn_obs_vel is not None and i < self.dyn_obs_vel.shape[0]:
+                    vel = self.dyn_obs_vel[i]
+                    if not (torch.isnan(vel).any() or torch.isinf(vel).any()):
+                        new_state[7:10] = vel
+                new_state[10:13] = 0.0
                 
-                dyn_obs_indices.append(obs_root_idx)
-                dyn_obs_new_states.append(new_state)
+                self.root_states[obs_root_idx] = new_state
             
-            # 如果有有效的动态障碍物索引，批量更新
-            if len(dyn_obs_indices) > 0:
-                # 🎯 关键修复：创建新的状态 tensor（只包含需要更新的障碍物）
-                dyn_obs_new_states_tensor = torch.stack(dyn_obs_new_states)  # [num_dyn_obs, 13]
-                
-                # 创建一个临时的完整 root_states 副本，只更新动态障碍物的状态
-                temp_root_states = self.root_states.clone()
-                for idx, new_state in zip(dyn_obs_indices, dyn_obs_new_states):
-                    temp_root_states[idx] = new_state
-                
-                # 🎯 关键修复：确保 temp_root_states 是连续的和 float32 类型
-                if not temp_root_states.is_contiguous():
-                    temp_root_states = temp_root_states.contiguous()
-                if temp_root_states.dtype != torch.float32:
-                    temp_root_states = temp_root_states.float()
-                
-                # 🎯 索引 tensor 格式
-                dyn_obs_root_indices = torch.tensor(dyn_obs_indices, dtype=torch.int64, device='cpu').to(dtype=torch.int32)
-                
-                # 🎯 使用索引方式更新这些特定的actor
-                try:
-                    self.gym.set_actor_root_state_tensor_indexed(
-                        self.sim,
-                        gymtorch.unwrap_tensor(temp_root_states),
-                        gymtorch.unwrap_tensor(dyn_obs_root_indices),
-                        len(dyn_obs_root_indices)
-                    )
-                    
-                    # 🎯 关键修复：添加 GPU 同步，确保 Isaac Gym 内部状态已更新
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                    
-                    # 🎯 重要：不要立即复制回 root_states！
-                    # 因为 root_states 是 gymtorch 包装的 tensor，直接修改可能导致内存不一致
-                    # 让 Isaac Gym 在下次 refresh_actor_root_state_tensor 时自动更新
-                    # 我们只在 temp_root_states 中修改，传递给 API，不修改原始 root_states
-                    
-                    # 🎯 验证：每100步打印一次更新信息
-                    if hasattr(self, 'dyn_obs_step_count') and self.dyn_obs_step_count % 100 == 0:
-                        print(f"[Dynamic Obstacles] Successfully updated {len(dyn_obs_indices)} obstacles using indexed update")
-                    
-                    # 🎯 关键修复：GPU同步，确保状态已写入
-                    if torch.cuda.is_available():
-                        torch.cuda.synchronize()
-                    
-                    # 🎯 关键修复：标记动态障碍物已更新（用于检测竞争条件）
-                    self._dynamic_obstacles_updated = True
-                    
-                    # 🚨 重要：不要在动态障碍物更新后立即调用step_graphics()，因为这可能导致竞争条件
-                    # 应该在render_depth()之前调用step_graphics()，而不是在这里
-                    # 注释掉这里的step_graphics()调用，避免竞争条件
-                    # if self.enable_viewer and self.viewer is not None:
-                    #     try:
-                    #         # 更新图形状态，确保viewer和相机传感器能看到最新的障碍物位置
-                    #         self.gym.step_graphics(self.sim)
-                    #     except Exception as e:
-                    #         print(f"[Warning] step_graphics() after dynamic obstacle indexed update failed: {e}")
-                    #         # 继续，可能图形状态已经更新
-                except Exception as e:
-                    print(f"[Warning] Indexed update failed: {e}")
-                    import traceback
-                    traceback.print_exc()
-            else:
-                print(f"[Warning] No valid dynamic obstacle indices to update")
-            
+            # 使用完整的 tensor 更新
+            # [patched] DISABLED full-buffer set for dynamic obstacles
         except Exception as e:
-            print(f"[Error] Failed to update dynamic obstacles: {e}")
-            import traceback
-            traceback.print_exc()
-            # 如果所有方法都失败，至少不要让程序崩溃
+            # 如果快速更新失败，静默失败（会在完整更新中处理）
+            pass
+
+    def _update_dynamic_obstacle_positions_to_sim(self, new_pos_xyz=None, new_vel_xyz=None, debug_name="dyn"):
+        """
+        将动态障碍物位置/速度写回仿真（只改对应索引，不全量覆盖）。
+        
+        必须满足：
+        - self.dyn_root_indices : torch.int32 (CPU), contiguous，长度=动态障碍物总数
+        - new_pos_xyz           : [num_dyn, 3]，CPU contiguous（如果为None，使用self.dyn_obs_state）
+        - new_vel_xyz（可选）   : [num_dyn, 3]，CPU contiguous（如果为None，使用self.dyn_obs_vel）
+        """
+        if self.num_dynamic_obstacles == 0 or self.dyn_obs_state is None or len(self.dynamic_obstacle_handles) == 0:
             return
+        
+        gym = self.gym
+        sim = self.sim
+        
+        # 0) 准备索引（CPU int32 contiguous）
+        # 优先使用 self.dyn_root_indices，如果没有则使用 self.dynamic_root_indices
+        if hasattr(self, 'dyn_root_indices') and self.dyn_root_indices.numel() > 0:
+            dyn_indices = self.dyn_root_indices
+        elif hasattr(self, 'dynamic_root_indices') and self.dynamic_root_indices.numel() > 0:
+            dyn_indices = self.dynamic_root_indices
+        else:
+            # 如果没有缓存的索引，计算它们
+            self.actors_per_env = 2 + self.num_obstacles + self.num_dynamic_obstacles
+            all_dyn_indices = []
+            for i in range(len(self.dynamic_obstacle_handles)):
+                env_idx = i // self.num_dynamic_obstacles
+                dyn_idx = i % self.num_dynamic_obstacles
+                obs_root_idx = env_idx * self.actors_per_env + 2 + self.num_obstacles + dyn_idx
+                all_dyn_indices.append(obs_root_idx)
+            dyn_indices = torch.tensor(all_dyn_indices, dtype=torch.int64, device='cpu')
+            self.dyn_root_indices = dyn_indices  # 缓存起来
+        
+        if dyn_indices.dtype != torch.int32 or dyn_indices.device.type != "cpu" or not dyn_indices.is_contiguous():
+            dyn_indices = dyn_indices.to(dtype=torch.int32, device="cpu").contiguous()
+        
+        assert dyn_indices.ndim == 1, f"[{debug_name}] dyn_indices must be 1-D, got {dyn_indices.shape}"
+        num_dyn = dyn_indices.numel()
+        if num_dyn == 0:
+            return
+        
+        # 1) 准备 new states（CPU contiguous，13通道齐全）
+        #    root state layout: [pos(3), rot(4), lin_vel(3), ang_vel(3)]
+        states = torch.zeros((num_dyn, 13), dtype=torch.float32, device="cpu")
+        
+        # 位置
+        if new_pos_xyz is not None:
+            if new_pos_xyz.device.type != "cpu":
+                pos_cpu = new_pos_xyz.to("cpu", non_blocking=True)
+            else:
+                pos_cpu = new_pos_xyz
+            # 确保形状匹配
+            if pos_cpu.shape[0] != num_dyn:
+                print(f"[{debug_name}] WARNING: new_pos_xyz shape {pos_cpu.shape} != num_dyn {num_dyn}, truncating/padding")
+                if pos_cpu.shape[0] > num_dyn:
+                    pos_cpu = pos_cpu[:num_dyn]
+                else:
+                    padding = torch.zeros((num_dyn - pos_cpu.shape[0], 3), dtype=torch.float32, device='cpu')
+                    pos_cpu = torch.cat([pos_cpu, padding], dim=0)
+        else:
+            # 使用 self.dyn_obs_state
+            if self.dyn_obs_state.shape[0] < num_dyn:
+                print(f"[{debug_name}] WARNING: dyn_obs_state shape {self.dyn_obs_state.shape[0]} < num_dyn {num_dyn}")
+                pos_cpu = torch.zeros((num_dyn, 3), dtype=torch.float32, device='cpu')
+            else:
+                pos_cpu = self.dyn_obs_state[:num_dyn, 0:3].to("cpu", non_blocking=True)
+        
+        states[:, 0:3] = pos_cpu.contiguous()
+        
+        # 姿态：不给就默认单位四元数
+        states[:, 3:7] = torch.tensor([0.0, 0.0, 0.0, 1.0], dtype=torch.float32).repeat(num_dyn, 1)
+        
+        # 线速度
+        if new_vel_xyz is not None:
+            vel = new_vel_xyz.to("cpu", non_blocking=True).contiguous()
+            states[:, 7:10] = vel
+        elif self.dyn_obs_vel is not None and self.dyn_obs_vel.shape[0] >= num_dyn:
+            vel = self.dyn_obs_vel[:num_dyn].to("cpu", non_blocking=True).contiguous()
+            states[:, 7:10] = vel
+        else:
+            states[:, 7:10] = 0.0
+        
+        # 角速度
+        states[:, 10:13] = 0.0
+        
+        # 2) 写入（只写索引，不全量覆盖）
+        # 🎯 关键：先更新 root_states 的对应行，然后传递完整的 root_states
+        indices_long = dyn_indices.to(dtype=torch.long)
+        self.root_states[indices_long] = states
+        
+        # 现在传递完整的 root_states 给 API
+        gym.set_actor_root_state_tensor_indexed(
+            sim,
+            gymtorch.unwrap_tensor(self.root_states),  # ✅ 完整的 root_states
+            gymtorch.unwrap_tensor(dyn_indices),        # ✅ 只给索引
+            num_dyn
+        )
+        
+        # 🎯 关键：等待 GPU 同步（如果使用 GPU PhysX）
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        
+        # 3) 立刻 refresh，保证下面读的是仿真里的最新数据
+        gym.refresh_actor_root_state_tensor(sim)
+        
+        # 4) 读回做一次校验（debug）
+        # 注意：self.root_states 一定要是 acquire 的"活指针"，不要自己 new tensor 覆盖它！
+        rs = self.root_states  # (total_actors, 13)
+        assert rs.device.type == "cpu", f"[{debug_name}] root_states must be CPU when use_gpu_pipeline=False"
+        readback = rs[dyn_indices.long(), 0:3].clone()
+        max_diff = (readback - pos_cpu).abs().max().item()
+        if max_diff > 1e-5:
+            print(f"[{debug_name}] WARNING: after refresh, readback!=target, max_diff={max_diff:.6f}")
+            # 继续放开跑也行，但你想要严格的话可以抛异常
+            # raise RuntimeError("root_states mismatch after set_actor_root_state_tensor_indexed")
+        
+        # 5) 自检：若外部有"全量覆盖"调用，会在下一次 step 后把我们写的值抹掉
+        #    这里设置一个易识别的"标记位"，下一帧验证它是否仍在
+        #    原理：我们利用 lin_vel.x（第7通道）存个小签名，正常物理不会在一帧内刚好改成相同 magic
+        # 🎯 注意：这个检查在同一个函数内立即进行，如果 refresh 后读取到旧值，
+        #    说明 API 调用可能没有生效，或者 Isaac Gym 内部状态还没有更新
+        magic = 1234.5678
+        states_magic = states.clone()
+        states_magic[:, 7] = magic
+        # 先更新 root_states
+        indices_long = dyn_indices.to(dtype=torch.long)
+        self.root_states[indices_long] = states_magic
+        # 然后传递完整的 root_states
+        gym.set_actor_root_state_tensor_indexed(
+            sim,
+            gymtorch.unwrap_tensor(self.root_states),  # ✅ 完整的 root_states
+            gymtorch.unwrap_tensor(dyn_indices),      # ✅ 只给索引
+            num_dyn
+        )
+        
+        # 🎯 关键：等待 GPU 同步（如果使用 GPU PhysX）
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
+        
+        # 🎯 关键：先检查 root_states 中的值（在 refresh 之前）
+        sig_before_refresh = self.root_states[indices_long, 7].clone()
+        if (sig_before_refresh - magic).abs().max().item() > 1e-4:
+            print(f"[{debug_name}] WARNING: magic signature not set in root_states before refresh!")
+            print(f"        Expected magic={magic:.4f}, got sig={sig_before_refresh.tolist()}")
+            print(f"        This suggests root_states binding may be broken or write failed")
+        
+        # 现在 refresh 并检查
+        gym.refresh_actor_root_state_tensor(sim)
+        sig_after_refresh = self.root_states[indices_long, 7].clone()
+        if (sig_after_refresh - magic).abs().max().item() > 1e-4:
+            print("[FATAL] root_state was overwritten by a subsequent full-tensor call in the same frame!")
+            print("        请全局搜索并删除任何 set_actor_root_state_tensor(self.sim, ...) 的调用；只保留 indexed 写法。")
+            print(f"        Expected magic={magic:.4f}, got sig={sig_after_refresh.tolist()}")
+            print(f"        Before refresh: {sig_before_refresh.tolist()}")
+            print(f"        After refresh: {sig_after_refresh.tolist()}")
+            print(f"        This suggests that either:")
+            print(f"        1. Another function called set_actor_root_state_tensor (non-indexed)")
+            print(f"        2. _apply_root_states_indexed was called after this update")
+            print(f"        3. root_states was re-assigned (breaking the binding)")
+            print(f"        4. API call failed silently (check Isaac Gym error logs)")
 
     def _check_occlusion(self, cam_pos: torch.Tensor, target_pos: torch.Tensor, env_idx: int = 0) -> bool:
         """
@@ -4973,8 +5282,9 @@ class ArmNavEnv:
         
         # 目标状态部分
         self.gym.refresh_actor_root_state_tensor(self.sim)
-        actor_root_state = self.gym.acquire_actor_root_state_tensor(self.sim)
-        self.root_states = gymtorch.wrap_tensor(actor_root_state)
+        # 🎯 修复：不要重新 acquire，只 refresh（避免破坏绑定）
+        if not hasattr(self, "root_states") or self.root_states is None:
+            raise RuntimeError("[Reset] root_states not initialized! Call _reacquire_root_tensor() first.")
         
         # 🎯 修复：确保障碍物位置已更新（在生成目标位置之前）
         # 注意：在reset_envs中，障碍物可能不需要重置，但位置需要更新
@@ -4982,7 +5292,6 @@ class ArmNavEnv:
         
         # 为每个需要重置的环境生成有效的目标位置和角度
         for idx, i in enumerate(env_indices):
-            # 🎯 使用验证函数生成安全的目标位置
             target_pos, yaw_deg = self._generate_valid_target_position(i, max_attempts=100)
             
             # 计算四元数（绕Z轴旋转）
@@ -5002,13 +5311,16 @@ class ArmNavEnv:
                 self.root_states[target_idx] = new_root_state
             self.target_pos[i] = target_pos
         # 批量应用root state更改（只影响env_indices）
-        env_ids = torch.tensor(env_indices, dtype=torch.int32, device='cpu')
-        self.gym.set_actor_root_state_tensor_indexed(
-            self.sim,
-            gymtorch.unwrap_tensor(self.root_states),
-            gymtorch.unwrap_tensor(env_ids),
-            len(env_ids)
-        )
+        # 🎯 使用统一的 _set_root_states_indexed 函数
+        target_indices_selected = self.target_root_indices[torch.as_tensor(env_indices, device=self.target_root_indices.device)]
+        target_indices_cpu = target_indices_selected.to(device='cpu', dtype=torch.int64)
+        target_poses_cpu = torch.zeros((len(env_indices), 7), dtype=torch.float32, device='cpu')
+        for idx, i in enumerate(env_indices):
+            target_idx = self.target_root_indices[i].cpu().item()
+            if target_idx < self.root_states.shape[0]:
+                target_poses_cpu[idx, 0:3] = self.root_states[target_idx, 0:3].cpu()
+                target_poses_cpu[idx, 3:7] = self.root_states[target_idx, 3:7].cpu()
+        self._set_root_states_indexed(target_indices_cpu, target_poses_cpu, keep_vel=False)
         # DOF复位（关节）
         for i in env_indices:
             start_idx = i * self.dof_count
@@ -5055,3 +5367,71 @@ class ArmNavEnv:
         self.prev_action = None
         # 返回当前观测
         return self.observe()
+    def _push_dyn_obs_states(self, new_states: torch.Tensor):
+        """
+        Write a batch of dynamic obstacles' root states to PhysX using cached SIM root indices.
+        - self.root_states: shared CPU tensor acquired+wrapped once
+        - self.dynamic_obstacle_root_indices: CPU Long tensor of SIM actor root indices (length K)
+        """
+        if not hasattr(self, "dynamic_obstacle_root_indices") or self.dynamic_obstacle_root_indices.numel() == 0:
+            raise RuntimeError("dynamic_obstacle_root_indices is not initialized")
+        # 🎯 使用统一的 _set_root_states_indexed 函数
+        indices_cpu = self.dynamic_obstacle_root_indices.to('cpu', dtype=torch.int64).contiguous()
+        new_states_cpu = new_states.to('cpu')
+        poses_cpu = torch.zeros((new_states_cpu.shape[0], 7), dtype=torch.float32, device='cpu')
+        poses_cpu[:, 0:3] = new_states_cpu[:, 0:3]
+        poses_cpu[:, 3:7] = new_states_cpu[:, 3:7]
+        self._set_root_states_indexed(indices_cpu, poses_cpu, keep_vel=False)
+
+
+    def _apply_root_states_indexed(self, indices: torch.Tensor, new_states: torch.Tensor) -> bool:
+        """
+        正确流程：
+        1) 先把 new_states 写到 self.root_states[indices]
+        2) 再用【整块】root_states + indices 调用 set_actor_root_state_tensor_indexed
+        形状与设备约束：
+        - self.root_states: (num_actors_total, 13), CPU float32, contiguous
+        - indices: int64 (long), CPU, contiguous
+        - new_states: (len(indices), 13), 任意设备，最终会搬到 CPU
+        """
+        try:
+            # 1) 确保 root_states 是 CPU float32 连续内存的大张量
+            # 🎯 关键修复：不要重新赋值 self.root_states，这会破坏与 Isaac Gym 的绑定！
+            # 如果设备/类型不对，应该先 refresh 再检查，或者确保在创建时就正确设置
+            if self.root_states.device.type != "cpu":
+                # 不要重新赋值，而是先 refresh 确保同步
+                self.gym.refresh_actor_root_state_tensor(self.sim)
+                # 如果还是不对，说明初始化有问题，这里只能报错
+                if self.root_states.device.type != "cpu":
+                    print(f"[RootState][Indexed] WARNING: root_states is on {self.root_states.device}, expected CPU")
+            # 同样，不要重新赋值 dtype/contiguous，只检查
+            if self.root_states.dtype != torch.float32:
+                print(f"[RootState][Indexed] WARNING: root_states dtype is {self.root_states.dtype}, expected float32")
+            if not self.root_states.is_contiguous():
+                print(f"[RootState][Indexed] WARNING: root_states is not contiguous")
+
+            # 2) 规范化索引与待写状态
+            idx_cpu = indices.to(device="cpu", dtype=torch.int64, non_blocking=False).contiguous()
+            ns_cpu  = new_states.to(device="cpu", dtype=torch.float32, non_blocking=False).contiguous()
+
+            assert ns_cpu.shape[0] == idx_cpu.numel() and ns_cpu.shape[1] == 13, \
+                f"[RootState] new_states shape={tuple(ns_cpu.shape)} vs indices={idx_cpu.numel()}"
+
+            # 3) 先写入整块 root_states
+            self.root_states.index_copy_(0, idx_cpu, ns_cpu)
+
+            # 4) 再调用 indexed API（第一个参数必须是整块 root_states）
+            # 🎯 关键修复：Isaac Gym 要求索引必须是 int32，不是 int64
+            idx_i32 = idx_cpu.to(dtype=torch.int32).contiguous()
+            self.gym.set_actor_root_state_tensor_indexed(
+                self.sim,
+                gymtorch.unwrap_tensor(self.root_states),  # ✅ 整块 root tensor
+                gymtorch.unwrap_tensor(idx_i32),           # ✅ 只给索引（int32）
+                idx_i32.numel()
+            )
+            return True
+        except Exception as e:
+            print(f"[RootState][Indexed] Failed: {e}")
+            return False
+    
+    
